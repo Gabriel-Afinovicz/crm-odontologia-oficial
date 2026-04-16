@@ -82,7 +82,7 @@ export function RecentLeads() {
           <thead>
             <tr className="border-b border-gray-100 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
               <th className="px-6 py-3">Nome</th>
-              <th className="px-6 py-3">Telefone</th>
+              <th className="px-6 py-3">Contato</th>
               <th className="px-6 py-3">Status</th>
               <th className="px-6 py-3">Data</th>
             </tr>
@@ -95,8 +95,16 @@ export function RecentLeads() {
                   <td className="whitespace-nowrap px-6 py-3 font-medium text-gray-900">
                     {lead.name}
                   </td>
-                  <td className="whitespace-nowrap px-6 py-3 text-gray-600">
-                    {lead.phone || "—"}
+                  <td className="px-6 py-3 text-gray-600">
+                    <div className="flex flex-col">
+                      {lead.phone && (
+                        <span className="text-sm">{lead.phone}</span>
+                      )}
+                      {lead.email && (
+                        <span className="text-xs text-gray-400">{lead.email}</span>
+                      )}
+                      {!lead.phone && !lead.email && "—"}
+                    </div>
                   </td>
                   <td className="whitespace-nowrap px-6 py-3">
                     <span

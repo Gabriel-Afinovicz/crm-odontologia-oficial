@@ -1,3 +1,5 @@
+// ── Enums ────────────────────────────────────────────────────────────────────
+
 export type UserRole = "admin" | "operator";
 
 export type LeadStatus =
@@ -7,14 +9,39 @@ export type LeadStatus =
   | "finalizado"
   | "perdido";
 
+export type ActivityType =
+  | "note"
+  | "call_inbound"
+  | "call_outbound"
+  | "whatsapp"
+  | "email"
+  | "appointment"
+  | "status_change"
+  | "assignment";
+
+export type CustomFieldType =
+  | "text"
+  | "number"
+  | "date"
+  | "select"
+  | "multi_select"
+  | "boolean"
+  | "phone"
+  | "email"
+  | "url";
+
+// ── Tabelas ──────────────────────────────────────────────────────────────────
+
 export interface Company {
   id: string;
   name: string;
-  domain: string;
+  domain: string | null;
   cnpj: string | null;
   phone: string | null;
   email: string | null;
+  address: string | null;
   is_active: boolean;
+  settings: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -22,9 +49,10 @@ export interface Company {
 export interface User {
   id: string;
   company_id: string;
-  auth_id: string;
+  auth_id: string | null;
   name: string;
   email: string;
+  phone: string | null;
   extension_number: string;
   role: UserRole;
   is_active: boolean;
@@ -39,9 +67,12 @@ export interface Lead {
   source_id: string | null;
   name: string;
   identifier: string | null;
+  email: string | null;
   phone: string | null;
   status: LeadStatus;
   notes: string | null;
+  lost_reason: string | null;
+  converted_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -50,6 +81,7 @@ export interface LeadSource {
   id: string;
   company_id: string;
   name: string;
+  is_active: boolean;
   created_at: string;
 }
 
@@ -57,12 +89,35 @@ export interface Activity {
   id: string;
   company_id: string;
   lead_id: string;
-  user_id: string;
-  activity_type: string;
-  title: string;
+  user_id: string | null;
+  activity_type: ActivityType;
+  title: string | null;
   description: string | null;
-  metadata: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
+  scheduled_at: string | null;
+  completed_at: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface CustomField {
+  id: string;
+  company_id: string;
+  name: string;
+  field_type: CustomFieldType;
+  options: unknown | null;
+  is_required: boolean;
+  display_order: number;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface CustomFieldValue {
+  id: string;
+  company_id: string;
+  lead_id: string;
+  custom_field_id: string;
+  value: string | null;
 }
 
 export interface Tag {
@@ -70,7 +125,15 @@ export interface Tag {
   company_id: string;
   name: string;
   color: string;
+  created_at: string;
 }
+
+export interface LeadTag {
+  lead_id: string;
+  tag_id: string;
+}
+
+// ── Views ────────────────────────────────────────────────────────────────────
 
 export interface LeadFunnel {
   company_id: string;
@@ -86,86 +149,66 @@ export interface LeadDetailed extends Lead {
 }
 
 export interface ActivityDetailed extends Activity {
-  user_name: string;
-  lead_name: string;
+  user_name: string | null;
+  lead_name: string | null;
 }
 
-// Supabase Database type for typed client
+// ── Database (Supabase typed client) ─────────────────────────────────────────
+
 export interface Database {
   public: {
     Tables: {
       companies: {
         Row: Company;
-        Insert: Omit<Company, "id" | "created_at" | "updated_at">;
+        Insert: Omit<Company, "id" | "created_at" | "updated_at" | "is_active" | "settings"> &
+          Partial<Pick<Company, "is_active" | "settings">>;
         Update: Partial<Omit<Company, "id" | "created_at" | "updated_at">>;
       };
       users: {
         Row: User;
-        Insert: Omit<User, "id" | "created_at" | "updated_at">;
+        Insert: Omit<User, "id" | "created_at" | "updated_at" | "role" | "is_active"> &
+          Partial<Pick<User, "role" | "is_active">>;
         Update: Partial<Omit<User, "id" | "created_at" | "updated_at">>;
       };
       leads: {
         Row: Lead;
-        Insert: Omit<Lead, "id" | "created_at" | "updated_at">;
+        Insert: Omit<Lead, "id" | "created_at" | "updated_at" | "status"> &
+          Partial<Pick<Lead, "status">>;
         Update: Partial<Omit<Lead, "id" | "created_at" | "updated_at">>;
       };
       lead_sources: {
         Row: LeadSource;
-        Insert: Omit<LeadSource, "id" | "created_at">;
+        Insert: Omit<LeadSource, "id" | "created_at" | "is_active"> &
+          Partial<Pick<LeadSource, "is_active">>;
         Update: Partial<Omit<LeadSource, "id" | "created_at">>;
       };
       activities: {
         Row: Activity;
-        Insert: Omit<Activity, "id" | "created_at">;
-        Update: Partial<Omit<Activity, "id" | "created_at">>;
+        Insert: Omit<Activity, "id" | "created_at" | "updated_at" | "metadata"> &
+          Partial<Pick<Activity, "metadata">>;
+        Update: Partial<Omit<Activity, "id" | "created_at" | "updated_at">>;
+      };
+      custom_fields: {
+        Row: CustomField;
+        Insert: Omit<CustomField, "id" | "created_at" | "field_type" | "is_required" | "display_order" | "is_active"> &
+          Partial<Pick<CustomField, "field_type" | "is_required" | "display_order" | "is_active">>;
+        Update: Partial<Omit<CustomField, "id" | "created_at">>;
+      };
+      custom_field_values: {
+        Row: CustomFieldValue;
+        Insert: Omit<CustomFieldValue, "id">;
+        Update: Partial<Omit<CustomFieldValue, "id">>;
       };
       tags: {
         Row: Tag;
-        Insert: Omit<Tag, "id">;
-        Update: Partial<Omit<Tag, "id">>;
+        Insert: Omit<Tag, "id" | "created_at" | "color"> &
+          Partial<Pick<Tag, "color">>;
+        Update: Partial<Omit<Tag, "id" | "created_at">>;
       };
       lead_tags: {
-        Row: { lead_id: string; tag_id: string };
-        Insert: { lead_id: string; tag_id: string };
-        Update: Partial<{ lead_id: string; tag_id: string }>;
-      };
-      custom_fields: {
-        Row: {
-          id: string;
-          company_id: string;
-          name: string;
-          field_type: string;
-          options: unknown | null;
-        };
-        Insert: Omit<
-          { id: string; company_id: string; name: string; field_type: string; options: unknown | null },
-          "id"
-        >;
-        Update: Partial<
-          Omit<
-            { id: string; company_id: string; name: string; field_type: string; options: unknown | null },
-            "id"
-          >
-        >;
-      };
-      custom_field_values: {
-        Row: {
-          id: string;
-          company_id: string;
-          lead_id: string;
-          custom_field_id: string;
-          value: string | null;
-        };
-        Insert: Omit<
-          { id: string; company_id: string; lead_id: string; custom_field_id: string; value: string | null },
-          "id"
-        >;
-        Update: Partial<
-          Omit<
-            { id: string; company_id: string; lead_id: string; custom_field_id: string; value: string | null },
-            "id"
-          >
-        >;
+        Row: LeadTag;
+        Insert: LeadTag;
+        Update: Partial<LeadTag>;
       };
     };
     Views: {
@@ -215,6 +258,8 @@ export interface Database {
     Enums: {
       user_role: UserRole;
       lead_status: LeadStatus;
+      activity_type: ActivityType;
+      custom_field_type: CustomFieldType;
     };
     CompositeTypes: Record<string, never>;
   };
