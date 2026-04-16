@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Lead } from "@/lib/types/database";
@@ -16,7 +18,12 @@ const statusBadge: Record<string, { label: string; classes: string }> = {
   perdido: { label: "Perdido", classes: "bg-red-100 text-red-700" },
 };
 
-export function RecentLeads() {
+interface RecentLeadsProps {
+  domain: string;
+}
+
+export function RecentLeads({ domain }: RecentLeadsProps) {
+  const router = useRouter();
   const [leads, setLeads] = useState<Lead[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -72,10 +79,16 @@ export function RecentLeads() {
 
   return (
     <Card padding="none">
-      <div className="p-6 pb-0">
+      <div className="flex items-center justify-between p-6 pb-0">
         <CardHeader>
           <CardTitle>Últimos Leads</CardTitle>
         </CardHeader>
+        <Link
+          href={`/${domain}/leads`}
+          className="text-sm font-medium text-blue-600 hover:text-blue-700"
+        >
+          Ver todos →
+        </Link>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -91,7 +104,11 @@ export function RecentLeads() {
             {leads.map((lead) => {
               const badge = statusBadge[lead.status];
               return (
-                <tr key={lead.id} className="hover:bg-gray-50">
+                <tr
+                  key={lead.id}
+                  onClick={() => router.push(`/${domain}/leads/${lead.id}`)}
+                  className="cursor-pointer hover:bg-gray-50"
+                >
                   <td className="whitespace-nowrap px-6 py-3 font-medium text-gray-900">
                     {lead.name}
                   </td>
