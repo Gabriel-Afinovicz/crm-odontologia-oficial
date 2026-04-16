@@ -34,16 +34,22 @@ export function LoginForm({ domain }: LoginFormProps) {
       );
 
       if (resolveError) {
-        throw new Error("Clínica ou ramal não encontrado.");
+        throw new Error(`Clínica ou ramal não encontrado. (${resolveError.message})`);
       }
 
-      const results = resolveData as { auth_email: string }[] | null;
+      let authEmail: string;
 
-      if (!results || results.length === 0) {
+      if (Array.isArray(resolveData) && resolveData.length > 0) {
+        authEmail = (resolveData[0] as { auth_email: string }).auth_email;
+      } else if (
+        resolveData &&
+        typeof resolveData === "object" &&
+        "auth_email" in resolveData
+      ) {
+        authEmail = (resolveData as { auth_email: string }).auth_email;
+      } else {
         throw new Error("Ramal não encontrado para esta clínica.");
       }
-
-      const authEmail = results[0].auth_email;
 
       const { error: signInError } = await supabase.auth.signInWithPassword({
         email: authEmail,
@@ -52,9 +58,9 @@ export function LoginForm({ domain }: LoginFormProps) {
 
       if (signInError) {
         if (signInError.message.includes("Invalid login credentials")) {
-          throw new Error("Senha incorreta. Tente novamente.");
+          throw new Error("Ramal ou senha incorretos.");
         }
-        throw new Error("Erro ao fazer login. Tente novamente.");
+        throw new Error(`Erro no login: ${signInError.message}`);
       }
 
       router.push(`/${domain}/dashboard`);
