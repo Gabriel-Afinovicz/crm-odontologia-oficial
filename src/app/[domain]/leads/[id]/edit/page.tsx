@@ -20,10 +20,23 @@ export default async function EditLeadPage({ params }: EditLeadPageProps) {
     redirect(`/${domain}`);
   }
 
+  const { data: company } = await supabase
+    .from("companies")
+    .select("id")
+    .eq("domain", domain)
+    .single();
+
+  const companyId = (company as { id: string } | null)?.id;
+
+  if (!companyId) {
+    redirect(`/${domain}`);
+  }
+
   const { data: lead, error } = await supabase
     .from("leads")
     .select("*")
     .eq("id", id)
+    .eq("company_id", companyId)
     .single();
 
   if (error || !lead) {

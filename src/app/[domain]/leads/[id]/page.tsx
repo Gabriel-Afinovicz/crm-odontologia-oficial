@@ -24,10 +24,23 @@ export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
     redirect(`/${domain}`);
   }
 
+  const { data: company } = await supabase
+    .from("companies")
+    .select("id")
+    .eq("domain", domain)
+    .single();
+
+  const companyId = (company as { id: string } | null)?.id;
+
+  if (!companyId) {
+    redirect(`/${domain}`);
+  }
+
   const { data: lead, error } = await supabase
     .from("vw_leads_detailed")
     .select("*")
     .eq("id", id)
+    .eq("company_id", companyId)
     .single();
 
   if (error || !lead) {

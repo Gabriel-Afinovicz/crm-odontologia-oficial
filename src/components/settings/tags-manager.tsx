@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import { Badge } from "@/components/ui/badge";
 import type { Tag } from "@/lib/types/database";
 
@@ -12,7 +12,7 @@ const PRESET_COLORS = [
 ];
 
 export function TagsManager() {
-  const { profile } = useAuth();
+  const { companyId, loading: companyLoading } = useCurrentCompany();
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(true);
   const [newName, setNewName] = useState("");
@@ -25,25 +25,37 @@ export function TagsManager() {
   const [operatingId, setOperatingId] = useState<string | null>(null);
 
   async function fetchTags() {
+    if (!companyId) return;
     const supabase = createClient();
-    const { data } = await supabase.from("tags").select("*").order("name");
+    const { data } = await supabase
+      .from("tags")
+      .select("*")
+      .eq("company_id", companyId)
+      .order("name");
     if (data) setTags(data as unknown as Tag[]);
     setLoading(false);
   }
 
   useEffect(() => {
+    if (companyLoading) return;
+    if (!companyId) {
+      setTags([]);
+      setLoading(false);
+      return;
+    }
     fetchTags();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyLoading, companyId]);
 
   async function handleCreate() {
-    if (!newName.trim() || !profile?.company_id) return;
+    if (!newName.trim() || !companyId) return;
     setError(null);
     setSaving(true);
     const supabase = createClient();
     const { error: insertError } = await supabase.from("tags").insert({
       name: newName.trim(),
       color: newColor,
-      company_id: profile.company_id,
+      company_id: companyId,
     });
     if (insertError) {
       setError(`Erro ao criar tag: ${insertError.message}`);

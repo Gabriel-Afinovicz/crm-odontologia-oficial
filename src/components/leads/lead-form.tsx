@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { Lead, LeadSource, User } from "@/lib/types/database";
 
 interface LeadFormProps {
@@ -16,7 +16,7 @@ interface LeadFormProps {
 
 export function LeadForm({ domain, lead }: LeadFormProps) {
   const router = useRouter();
-  const { profile } = useAuth();
+  const { companyId } = useCurrentCompany();
   const isEditing = !!lead;
 
   const [name, setName] = useState(lead?.name || "");
@@ -32,12 +32,24 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
   const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {
+    if (!companyId) return;
+
     async function loadOptions() {
       const supabase = createClient();
 
       const [sourcesRes, usersRes] = await Promise.all([
-        supabase.from("lead_sources").select("*").eq("is_active", true).order("name"),
-        supabase.from("users").select("*").eq("is_active", true).order("name"),
+        supabase
+          .from("lead_sources")
+          .select("*")
+          .eq("company_id", companyId!)
+          .eq("is_active", true)
+          .order("name"),
+        supabase
+          .from("users")
+          .select("*")
+          .eq("company_id", companyId!)
+          .eq("is_active", true)
+          .order("name"),
       ]);
 
       if (sourcesRes.data) setSources(sourcesRes.data as unknown as LeadSource[]);
@@ -45,7 +57,7 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
     }
 
     loadOptions();
-  }, []);
+  }, [companyId]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -56,7 +68,7 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
       return;
     }
 
-    if (!isEditing && !profile?.company_id) {
+    if (!isEditing && !companyId) {
       setError("Não foi possível identificar a empresa. Tente recarregar a página.");
       return;
     }
@@ -90,7 +102,7 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
     } else {
       const { data: newLead, error: insertError } = await supabase
         .from("leads")
-        .insert({ ...payload, company_id: profile!.company_id })
+        .insert({ ...payload, company_id: companyId! })
         .select("id")
         .single();
 

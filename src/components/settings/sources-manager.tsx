@@ -2,11 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { LeadSource } from "@/lib/types/database";
 
 export function SourcesManager() {
-  const { profile } = useAuth();
+  const { companyId, loading: companyLoading } = useCurrentCompany();
   const [sources, setSources] = useState<LeadSource[]>([]);
   const [loading, setLoading] = useState(true);
   const [newName, setNewName] = useState("");
@@ -17,24 +17,36 @@ export function SourcesManager() {
   const [operatingId, setOperatingId] = useState<string | null>(null);
 
   async function fetchSources() {
+    if (!companyId) return;
     const supabase = createClient();
-    const { data } = await supabase.from("lead_sources").select("*").order("name");
+    const { data } = await supabase
+      .from("lead_sources")
+      .select("*")
+      .eq("company_id", companyId)
+      .order("name");
     if (data) setSources(data as unknown as LeadSource[]);
     setLoading(false);
   }
 
   useEffect(() => {
+    if (companyLoading) return;
+    if (!companyId) {
+      setSources([]);
+      setLoading(false);
+      return;
+    }
     fetchSources();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyLoading, companyId]);
 
   async function handleCreate() {
-    if (!newName.trim() || !profile?.company_id) return;
+    if (!newName.trim() || !companyId) return;
     setError(null);
     setSaving(true);
     const supabase = createClient();
     const { error: insertError } = await supabase.from("lead_sources").insert({
       name: newName.trim(),
-      company_id: profile.company_id,
+      company_id: companyId,
     });
     if (insertError) {
       setError(`Erro ao criar fonte: ${insertError.message}`);

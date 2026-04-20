@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { ActivityType } from "@/lib/types/database";
 
 interface AddActivityFormProps {
@@ -23,6 +24,7 @@ const ACTIVITY_TYPES: { value: ActivityType; label: string }[] = [
 export function AddActivityForm({ leadId }: AddActivityFormProps) {
   const router = useRouter();
   const { profile } = useAuth();
+  const { companyId } = useCurrentCompany();
   const [activityType, setActivityType] = useState<ActivityType>("note");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -43,7 +45,7 @@ export function AddActivityForm({ leadId }: AddActivityFormProps) {
     const { error } = await supabase.from("activities").insert({
       lead_id: leadId,
       user_id: profile?.id || null,
-      company_id: profile?.company_id || "",
+      company_id: companyId || "",
       activity_type: activityType,
       title: title.trim() || (activityType === "note" ? "Nota adicionada" : null),
       description: description.trim() || null,

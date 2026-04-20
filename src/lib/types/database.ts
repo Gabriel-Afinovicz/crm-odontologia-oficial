@@ -1,6 +1,6 @@
 // ── Enums ────────────────────────────────────────────────────────────────────
 
-export type UserRole = "admin" | "operator";
+export type UserRole = "admin" | "operator" | "super_admin";
 
 export type LeadStatus =
   | "novo"
@@ -234,7 +234,7 @@ export interface Database {
           p_email: string;
           p_extension_number: string;
           p_password: string;
-          p_role: UserRole;
+          p_role: "admin" | "operator";
         };
         Returns: string;
       };

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { CustomField, CustomFieldValue } from "@/lib/types/database";
 
 interface LeadCustomFieldsProps {
@@ -10,7 +10,7 @@ interface LeadCustomFieldsProps {
 }
 
 export function LeadCustomFields({ leadId }: LeadCustomFieldsProps) {
-  const { profile } = useAuth();
+  const { companyId } = useCurrentCompany();
   const [fields, setFields] = useState<CustomField[]>([]);
   const [values, setValues] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
@@ -19,12 +19,23 @@ export function LeadCustomFields({ leadId }: LeadCustomFieldsProps) {
   const [existingValues, setExistingValues] = useState<CustomFieldValue[]>([]);
 
   useEffect(() => {
+    if (!companyId) return;
+
     async function fetchData() {
       const supabase = createClient();
 
       const [fieldsRes, valuesRes] = await Promise.all([
-        supabase.from("custom_fields").select("*").eq("is_active", true).order("display_order"),
-        supabase.from("custom_field_values").select("*").eq("lead_id", leadId),
+        supabase
+          .from("custom_fields")
+          .select("*")
+          .eq("company_id", companyId!)
+          .eq("is_active", true)
+          .order("display_order"),
+        supabase
+          .from("custom_field_values")
+          .select("*")
+          .eq("company_id", companyId!)
+          .eq("lead_id", leadId),
       ]);
 
       const fieldsList = (fieldsRes.data as unknown as CustomField[]) || [];
@@ -42,7 +53,7 @@ export function LeadCustomFields({ leadId }: LeadCustomFieldsProps) {
     }
 
     fetchData();
-  }, [leadId]);
+  }, [leadId, companyId]);
 
   function handleChange(fieldId: string, val: string) {
     setValues((prev) => ({ ...prev, [fieldId]: val }));
@@ -50,7 +61,7 @@ export function LeadCustomFields({ leadId }: LeadCustomFieldsProps) {
   }
 
   async function handleSave() {
-    if (!profile?.company_id) return;
+    if (!companyId) return;
     setSaving(true);
     const supabase = createClient();
 
@@ -69,7 +80,7 @@ export function LeadCustomFields({ leadId }: LeadCustomFieldsProps) {
         await supabase.from("custom_field_values").insert({
           lead_id: leadId,
           custom_field_id: field.id,
-          company_id: profile.company_id,
+          company_id: companyId,
           value: val,
         });
       }

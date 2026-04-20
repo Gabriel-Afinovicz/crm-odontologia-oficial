@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Lead } from "@/lib/types/database";
 
@@ -24,15 +25,24 @@ interface RecentLeadsProps {
 
 export function RecentLeads({ domain }: RecentLeadsProps) {
   const router = useRouter();
+  const { companyId, loading: companyLoading } = useCurrentCompany();
   const [leads, setLeads] = useState<Lead[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (companyLoading) return;
+    if (!companyId) {
+      setLeads([]);
+      setLoading(false);
+      return;
+    }
+
     async function fetchLeads() {
       const supabase = createClient();
       const { data } = await supabase
         .from("leads")
         .select("*")
+        .eq("company_id", companyId!)
         .order("created_at", { ascending: false })
         .limit(10);
 
@@ -41,7 +51,7 @@ export function RecentLeads({ domain }: RecentLeadsProps) {
     }
 
     fetchLeads();
-  }, []);
+  }, [companyLoading, companyId]);
 
   if (loading) {
     return (

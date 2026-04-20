@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { LeadDetailed, LeadStatus } from "@/lib/types/database";
 import { StatusBadge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -22,17 +23,26 @@ interface LeadTableProps {
 
 export function LeadTable({ domain }: LeadTableProps) {
   const router = useRouter();
+  const { companyId, loading: companyLoading } = useCurrentCompany();
   const [leads, setLeads] = useState<LeadDetailed[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<LeadStatus | "todos">("todos");
   const [search, setSearch] = useState("");
 
   useEffect(() => {
+    if (companyLoading) return;
+    if (!companyId) {
+      setLeads([]);
+      setLoading(false);
+      return;
+    }
+
     async function fetchLeads() {
       const supabase = createClient();
       const { data, error } = await supabase
         .from("vw_leads_detailed")
         .select("*")
+        .eq("company_id", companyId!)
         .order("created_at", { ascending: false });
 
       if (!error && data) {
@@ -42,7 +52,7 @@ export function LeadTable({ domain }: LeadTableProps) {
     }
 
     fetchLeads();
-  }, []);
+  }, [companyLoading, companyId]);
 
   const filtered = useMemo(() => {
     let result = leads;

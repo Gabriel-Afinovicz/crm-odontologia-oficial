@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import { Badge } from "@/components/ui/badge";
 import type { Tag } from "@/lib/types/database";
 
@@ -16,7 +16,7 @@ const PRESET_COLORS = [
 ];
 
 export function LeadTags({ leadId }: LeadTagsProps) {
-  const { profile } = useAuth();
+  const { companyId } = useCurrentCompany();
   const [tags, setTags] = useState<Tag[]>([]);
   const [allTags, setAllTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,11 +28,16 @@ export function LeadTags({ leadId }: LeadTagsProps) {
   const pickerRef = useRef<HTMLDivElement>(null);
 
   async function fetchData() {
+    if (!companyId) return;
     const supabase = createClient();
 
     const [leadTagsRes, allTagsRes] = await Promise.all([
       supabase.from("lead_tags").select("tag_id").eq("lead_id", leadId),
-      supabase.from("tags").select("*").order("name"),
+      supabase
+        .from("tags")
+        .select("*")
+        .eq("company_id", companyId)
+        .order("name"),
     ]);
 
     const allTagsList = (allTagsRes.data as unknown as Tag[]) || [];
@@ -49,9 +54,10 @@ export function LeadTags({ leadId }: LeadTagsProps) {
   }
 
   useEffect(() => {
+    if (!companyId) return;
     fetchData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leadId]);
+  }, [leadId, companyId]);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -80,13 +86,13 @@ export function LeadTags({ leadId }: LeadTagsProps) {
   }
 
   async function createAndAddTag() {
-    if (!newName.trim() || !profile?.company_id) return;
+    if (!newName.trim() || !companyId) return;
     setSaving(true);
     const supabase = createClient();
 
     const { data: newTag } = await supabase
       .from("tags")
-      .insert({ name: newName.trim(), color: newColor, company_id: profile.company_id })
+      .insert({ name: newName.trim(), color: newColor, company_id: companyId })
       .select("id")
       .single();
 

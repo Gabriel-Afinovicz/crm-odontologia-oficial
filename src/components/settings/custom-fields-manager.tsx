@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { CustomField, CustomFieldType } from "@/lib/types/database";
 
 const FIELD_TYPE_OPTIONS: { value: CustomFieldType; label: string }[] = [
@@ -20,7 +20,7 @@ const FIELD_TYPE_OPTIONS: { value: CustomFieldType; label: string }[] = [
 const hasOptions = (type: CustomFieldType) => type === "select" || type === "multi_select";
 
 export function CustomFieldsManager() {
-  const { profile } = useAuth();
+  const { companyId, loading: companyLoading } = useCurrentCompany();
   const [fields, setFields] = useState<CustomField[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -39,18 +39,30 @@ export function CustomFieldsManager() {
   const [operatingId, setOperatingId] = useState<string | null>(null);
 
   async function fetchFields() {
+    if (!companyId) return;
     const supabase = createClient();
-    const { data } = await supabase.from("custom_fields").select("*").order("display_order");
+    const { data } = await supabase
+      .from("custom_fields")
+      .select("*")
+      .eq("company_id", companyId)
+      .order("display_order");
     if (data) setFields(data as unknown as CustomField[]);
     setLoading(false);
   }
 
   useEffect(() => {
+    if (companyLoading) return;
+    if (!companyId) {
+      setFields([]);
+      setLoading(false);
+      return;
+    }
     fetchFields();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyLoading, companyId]);
 
   async function handleCreate() {
-    if (!newName.trim() || !profile?.company_id) return;
+    if (!newName.trim() || !companyId) return;
     setError(null);
     setSaving(true);
     const supabase = createClient();
@@ -65,7 +77,7 @@ export function CustomFieldsManager() {
       is_required: newRequired,
       options: optionsArr,
       display_order: fields.length,
-      company_id: profile.company_id,
+      company_id: companyId,
     });
 
     if (insertError) {

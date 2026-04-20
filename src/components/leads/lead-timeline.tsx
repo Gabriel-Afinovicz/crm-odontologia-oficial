@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { ActivityDetailed, ActivityType } from "@/lib/types/database";
 
 interface LeadTimelineProps {
@@ -20,15 +21,19 @@ const typeConfig: Record<ActivityType, { label: string; color: string; icon: str
 };
 
 export function LeadTimeline({ leadId }: LeadTimelineProps) {
+  const { companyId } = useCurrentCompany();
   const [activities, setActivities] = useState<ActivityDetailed[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!companyId) return;
+
     async function fetchActivities() {
       const supabase = createClient();
       const { data, error } = await supabase
         .from("vw_activities_detailed")
         .select("*")
+        .eq("company_id", companyId!)
         .eq("lead_id", leadId)
         .order("created_at", { ascending: false });
 
@@ -39,7 +44,7 @@ export function LeadTimeline({ leadId }: LeadTimelineProps) {
     }
 
     fetchActivities();
-  }, [leadId]);
+  }, [leadId, companyId]);
 
   if (loading) {
     return (
