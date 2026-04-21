@@ -18,7 +18,6 @@ export function UserInfo({ domain, companyName }: UserInfoProps) {
     const isSuperAdmin = profile?.role === "super_admin";
     await signOut();
     router.push(isSuperAdmin ? "/wosnicz" : `/${domain}`);
-    router.refresh();
   }
 
   if (loading) {

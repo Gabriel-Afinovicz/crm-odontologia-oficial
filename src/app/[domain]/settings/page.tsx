@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthSession } from "@/lib/supabase/cached-data";
 import { SettingsContent } from "@/components/settings/settings-content";
 
 interface SettingsPageProps {
@@ -8,15 +8,15 @@ interface SettingsPageProps {
 
 export default async function SettingsPage({ params }: SettingsPageProps) {
   const { domain } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { user, role } = await getAuthSession();
 
   if (!user) {
     redirect(`/${domain}`);
   }
 
-  return <SettingsContent />;
+  if (role !== "admin" && role !== "super_admin") {
+    redirect(`/${domain}/dashboard`);
+  }
+
+  return <SettingsContent canManageOperators />;
 }

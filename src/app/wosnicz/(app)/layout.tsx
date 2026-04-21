@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthSession } from "@/lib/supabase/cached-data";
 import { MasterHeader } from "@/components/wosnicz/master-header";
 
 export default async function WosniczAppLayout({
@@ -7,28 +7,13 @@ export default async function WosniczAppLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { user, role, userDomain } = await getAuthSession();
 
   if (!user) {
     redirect("/wosnicz");
   }
 
-  const { data: profile } = await supabase
-    .from("users")
-    .select("role, companies(domain)")
-    .eq("auth_id", user.id)
-    .single();
-
-  const record = profile as {
-    role: string | null;
-    companies: { domain: string | null } | null;
-  } | null;
-
-  if (record?.role !== "super_admin") {
-    const userDomain = record?.companies?.domain;
+  if (role !== "super_admin") {
     redirect(userDomain ? `/${userDomain}/dashboard` : "/");
   }
 

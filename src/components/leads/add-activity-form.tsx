@@ -58,7 +58,6 @@ export function AddActivityForm({ leadId }: AddActivityFormProps) {
       setScheduledAt("");
       setActivityType("note");
       router.refresh();
-      window.location.reload();
     }
 
     setSaving(false);

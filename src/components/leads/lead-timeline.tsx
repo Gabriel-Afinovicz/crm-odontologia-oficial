@@ -7,6 +7,7 @@ import type { ActivityDetailed, ActivityType } from "@/lib/types/database";
 
 interface LeadTimelineProps {
   leadId: string;
+  initialActivities?: ActivityDetailed[];
 }
 
 const typeConfig: Record<ActivityType, { label: string; color: string; icon: string }> = {
@@ -20,12 +21,15 @@ const typeConfig: Record<ActivityType, { label: string; color: string; icon: str
   assignment: { label: "Atribuição", color: "bg-indigo-200 text-indigo-700", icon: "👤" },
 };
 
-export function LeadTimeline({ leadId }: LeadTimelineProps) {
+export function LeadTimeline({ leadId, initialActivities }: LeadTimelineProps) {
   const { companyId } = useCurrentCompany();
-  const [activities, setActivities] = useState<ActivityDetailed[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [activities, setActivities] = useState<ActivityDetailed[]>(
+    initialActivities ?? []
+  );
+  const [loading, setLoading] = useState(initialActivities === undefined);
 
   useEffect(() => {
+    if (initialActivities !== undefined) return;
     if (!companyId) return;
 
     async function fetchActivities() {
@@ -44,7 +48,7 @@ export function LeadTimeline({ leadId }: LeadTimelineProps) {
     }
 
     fetchActivities();
-  }, [leadId, companyId]);
+  }, [leadId, companyId, initialActivities]);
 
   if (loading) {
     return (

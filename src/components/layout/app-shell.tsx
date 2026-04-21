@@ -5,10 +5,11 @@ import { Sidebar } from "./sidebar";
 
 interface AppShellProps {
   domain: string;
+  showSettings: boolean;
   children: React.ReactNode;
 }
 
-export function AppShell({ domain, children }: AppShellProps) {
+export function AppShell({ domain, showSettings, children }: AppShellProps) {
   const pathname = usePathname();
   const isLoginPage = pathname === `/${domain}`;
 
@@ -18,7 +19,7 @@ export function AppShell({ domain, children }: AppShellProps) {
 
   return (
     <div className="flex h-screen overflow-hidden bg-gray-50">
-      <Sidebar domain={domain} />
+      <Sidebar domain={domain} showSettings={showSettings} />
       <main className="flex-1 overflow-y-auto">{children}</main>
     </div>
   );

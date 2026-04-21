@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthSession } from "@/lib/supabase/cached-data";
 import { LeadTable } from "@/components/leads/lead-table";
 import Link from "next/link";
 
@@ -9,11 +9,7 @@ interface LeadsPageProps {
 
 export default async function LeadsPage({ params }: LeadsPageProps) {
   const { domain } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { user } = await getAuthSession();
 
   if (!user) {
     redirect(`/${domain}`);

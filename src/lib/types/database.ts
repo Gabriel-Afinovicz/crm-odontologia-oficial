@@ -56,8 +56,82 @@ export interface User {
   extension_number: string;
   role: UserRole;
   is_active: boolean;
+  is_dentist: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface PipelineStage {
+  id: string;
+  company_id: string;
+  name: string;
+  color: string;
+  position: number;
+  is_won: boolean;
+  is_lost: boolean;
+  is_active: boolean;
+  legacy_status: LeadStatus | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Specialty {
+  id: string;
+  company_id: string;
+  name: string;
+  color: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export type AppointmentStatus =
+  | "scheduled"
+  | "confirmed"
+  | "completed"
+  | "cancelled"
+  | "no_show";
+
+export interface Room {
+  id: string;
+  company_id: string;
+  name: string;
+  color: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface ProcedureType {
+  id: string;
+  company_id: string;
+  name: string;
+  default_duration_minutes: number;
+  default_value: number | null;
+  specialty_id: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface Appointment {
+  id: string;
+  company_id: string;
+  lead_id: string;
+  dentist_id: string | null;
+  room_id: string | null;
+  procedure_type_id: string | null;
+  starts_at: string;
+  ends_at: string;
+  status: AppointmentStatus;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AppointmentDetailed extends Appointment {
+  lead_name: string | null;
+  dentist_name: string | null;
+  room_name: string | null;
+  room_color: string | null;
+  procedure_name: string | null;
 }
 
 export interface Lead {
@@ -70,9 +144,19 @@ export interface Lead {
   email: string | null;
   phone: string | null;
   status: LeadStatus;
+  stage_id: string;
+  specialty_id: string | null;
   notes: string | null;
   lost_reason: string | null;
   converted_at: string | null;
+  kanban_position: number;
+  photo_url: string | null;
+  birthdate: string | null;
+  gender: string | null;
+  guardian_name: string | null;
+  guardian_phone: string | null;
+  allergies: string | null;
+  clinical_notes: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -145,7 +229,15 @@ export interface LeadFunnel {
 
 export interface LeadDetailed extends Lead {
   assigned_to_name: string | null;
+  assigned_is_dentist: boolean | null;
   source_name: string | null;
+  stage_name: string | null;
+  stage_color: string | null;
+  stage_position: number | null;
+  stage_is_won: boolean | null;
+  stage_is_lost: boolean | null;
+  specialty_name: string | null;
+  specialty_color: string | null;
 }
 
 export interface ActivityDetailed extends Activity {
@@ -172,9 +264,61 @@ export interface Database {
       };
       leads: {
         Row: Lead;
-        Insert: Omit<Lead, "id" | "created_at" | "updated_at" | "status"> &
-          Partial<Pick<Lead, "status">>;
+        Insert: Omit<
+          Lead,
+          "id" | "created_at" | "updated_at" | "status" | "specialty_id" | "kanban_position"
+        > &
+          Partial<Pick<Lead, "status" | "specialty_id" | "kanban_position">>;
         Update: Partial<Omit<Lead, "id" | "created_at" | "updated_at">>;
+      };
+      pipeline_stages: {
+        Row: PipelineStage;
+        Insert: Omit<
+          PipelineStage,
+          "id" | "created_at" | "updated_at" | "is_active" | "is_won" | "is_lost" | "color" | "position"
+        > &
+          Partial<
+            Pick<
+              PipelineStage,
+              "id" | "is_active" | "is_won" | "is_lost" | "color" | "position" | "legacy_status"
+            >
+          >;
+        Update: Partial<Omit<PipelineStage, "id" | "created_at" | "updated_at">>;
+      };
+      specialties: {
+        Row: Specialty;
+        Insert: Omit<Specialty, "id" | "created_at" | "is_active" | "color"> &
+          Partial<Pick<Specialty, "is_active" | "color">>;
+        Update: Partial<Omit<Specialty, "id" | "created_at">>;
+      };
+      rooms: {
+        Row: Room;
+        Insert: Omit<Room, "id" | "created_at" | "is_active" | "color"> &
+          Partial<Pick<Room, "is_active" | "color">>;
+        Update: Partial<Omit<Room, "id" | "created_at">>;
+      };
+      procedure_types: {
+        Row: ProcedureType;
+        Insert: Omit<
+          ProcedureType,
+          "id" | "created_at" | "is_active" | "default_duration_minutes" | "default_value" | "specialty_id"
+        > &
+          Partial<
+            Pick<
+              ProcedureType,
+              "is_active" | "default_duration_minutes" | "default_value" | "specialty_id"
+            >
+          >;
+        Update: Partial<Omit<ProcedureType, "id" | "created_at">>;
+      };
+      appointments: {
+        Row: Appointment;
+        Insert: Omit<
+          Appointment,
+          "id" | "created_at" | "updated_at" | "status" | "notes"
+        > &
+          Partial<Pick<Appointment, "status" | "notes">>;
+        Update: Partial<Omit<Appointment, "id" | "created_at" | "updated_at">>;
       };
       lead_sources: {
         Row: LeadSource;
@@ -252,6 +396,38 @@ export interface Database {
       };
       seed_company_defaults: {
         Args: { p_company_id: string };
+        Returns: void;
+      };
+      apply_kanban_move: {
+        Args: {
+          p_lead_id: string;
+          p_from_status: LeadStatus;
+          p_to_status: LeadStatus;
+          p_dest_ordered_ids: string[];
+          p_source_ordered_ids: string[];
+        };
+        Returns: void;
+      };
+      check_appointment_conflict: {
+        Args: {
+          p_dentist_id: string | null;
+          p_room_id: string | null;
+          p_starts_at: string;
+          p_ends_at: string;
+          p_exclude_id?: string | null;
+        };
+        Returns: boolean;
+      };
+      apply_kanban_move_v2: {
+        Args: {
+          p_lead_id: string;
+          p_from_stage_id: string;
+          p_to_stage_id: string;
+          p_dest_ordered_ids: string[];
+          p_source_ordered_ids: string[];
+          p_specialty_id?: string | null;
+          p_lost_reason?: string | null;
+        };
         Returns: void;
       };
     };

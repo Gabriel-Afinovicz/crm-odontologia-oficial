@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthSession } from "@/lib/supabase/cached-data";
 import { LeadForm } from "@/components/leads/lead-form";
 import Link from "next/link";
 
@@ -9,11 +9,7 @@ interface NewLeadPageProps {
 
 export default async function NewLeadPage({ params }: NewLeadPageProps) {
   const { domain } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { user } = await getAuthSession();
 
   if (!user) {
     redirect(`/${domain}`);

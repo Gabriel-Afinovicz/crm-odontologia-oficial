@@ -4,33 +4,29 @@ import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { CustomField, CustomFieldType } from "@/lib/types/database";
+import { AddCustomFieldForm } from "./add-custom-field-form";
 
-const FIELD_TYPE_OPTIONS: { value: CustomFieldType; label: string }[] = [
-  { value: "text", label: "Texto" },
-  { value: "number", label: "Número" },
-  { value: "date", label: "Data" },
-  { value: "boolean", label: "Sim/Não" },
-  { value: "select", label: "Seleção única" },
-  { value: "multi_select", label: "Seleção múltipla" },
-  { value: "phone", label: "Telefone" },
-  { value: "email", label: "E-mail" },
-  { value: "url", label: "URL" },
-];
+const FIELD_TYPE_LABELS: Record<CustomFieldType, string> = {
+  text: "Texto",
+  number: "Número",
+  date: "Data",
+  boolean: "Sim/Não",
+  select: "Seleção única",
+  multi_select: "Seleção múltipla",
+  phone: "Telefone",
+  email: "E-mail",
+  url: "URL",
+};
 
-const hasOptions = (type: CustomFieldType) => type === "select" || type === "multi_select";
+const hasOptions = (type: CustomFieldType) =>
+  type === "select" || type === "multi_select";
 
 export function CustomFieldsManager() {
   const { companyId, loading: companyLoading } = useCurrentCompany();
   const [fields, setFields] = useState<CustomField[]>([]);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
-
-  const [newName, setNewName] = useState("");
-  const [newType, setNewType] = useState<CustomFieldType>("text");
-  const [newRequired, setNewRequired] = useState(false);
-  const [newOptions, setNewOptions] = useState("");
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -60,40 +56,6 @@ export function CustomFieldsManager() {
     fetchFields();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [companyLoading, companyId]);
-
-  async function handleCreate() {
-    if (!newName.trim() || !companyId) return;
-    setError(null);
-    setSaving(true);
-    const supabase = createClient();
-
-    const optionsArr = hasOptions(newType)
-      ? newOptions.split(",").map((o) => o.trim()).filter(Boolean)
-      : null;
-
-    const { error: insertError } = await supabase.from("custom_fields").insert({
-      name: newName.trim(),
-      field_type: newType,
-      is_required: newRequired,
-      options: optionsArr,
-      display_order: fields.length,
-      company_id: companyId,
-    });
-
-    if (insertError) {
-      setError(`Erro ao criar campo: ${insertError.message}`);
-      setSaving(false);
-      return;
-    }
-
-    setNewName("");
-    setNewType("text");
-    setNewRequired(false);
-    setNewOptions("");
-    setShowForm(false);
-    setSaving(false);
-    await fetchFields();
-  }
 
   async function handleUpdate(id: string) {
     if (!editName.trim()) return;
@@ -159,7 +121,7 @@ export function CustomFieldsManager() {
   }
 
   function typeLabel(type: CustomFieldType) {
-    return FIELD_TYPE_OPTIONS.find((o) => o.value === type)?.label || type;
+    return FIELD_TYPE_LABELS[type] ?? type;
   }
 
   if (loading) {
@@ -184,81 +146,17 @@ export function CustomFieldsManager() {
           </svg>
           Novo Campo
         </button>
-      ) : (
-        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-          <h3 className="mb-3 text-sm font-semibold text-gray-700">Novo Campo Personalizado</h3>
-          <div className="space-y-3">
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label className="mb-1 block text-sm text-gray-600">Nome</label>
-                <input
-                  type="text"
-                  placeholder="Ex: CPF, Convênio..."
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm text-gray-600">Tipo</label>
-                <select
-                  value={newType}
-                  onChange={(e) => setNewType(e.target.value as CustomFieldType)}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                >
-                  {FIELD_TYPE_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            {hasOptions(newType) && (
-              <div>
-                <label className="mb-1 block text-sm text-gray-600">Opções (separadas por vírgula)</label>
-                <input
-                  type="text"
-                  placeholder="Opção 1, Opção 2, Opção 3"
-                  value={newOptions}
-                  onChange={(e) => setNewOptions(e.target.value)}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                />
-              </div>
-            )}
-
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={newRequired}
-                onChange={(e) => setNewRequired(e.target.checked)}
-                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-              />
-              <span className="text-sm text-gray-600">Campo obrigatório</span>
-            </label>
-
-            <div className="flex gap-2">
-              <button
-                onClick={handleCreate}
-                disabled={saving || !newName.trim()}
-                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
-              >
-                {saving ? (
-                  <span className="flex items-center gap-2">
-                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                    Criando...
-                  </span>
-                ) : "Criar Campo"}
-              </button>
-              <button
-                onClick={() => setShowForm(false)}
-                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
-              >
-                Cancelar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      ) : companyId ? (
+        <AddCustomFieldForm
+          companyId={companyId}
+          currentFieldCount={fields.length}
+          onCreated={async () => {
+            setShowForm(false);
+            await fetchFields();
+          }}
+          onCancel={() => setShowForm(false)}
+        />
+      ) : null}
 
       <div className="rounded-xl border border-gray-200 bg-white shadow-sm">
         {fields.length === 0 ? (

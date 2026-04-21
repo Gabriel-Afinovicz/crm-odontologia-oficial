@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthSession, getDomainCompany } from "@/lib/supabase/cached-data";
+import { getDashboardData, getKanbanData } from "@/lib/supabase/dashboard-data";
 import { DashboardContent } from "./dashboard-content";
 
 interface DashboardPageProps {
@@ -8,23 +9,41 @@ interface DashboardPageProps {
 
 export default async function DashboardPage({ params }: DashboardPageProps) {
   const { domain } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const [{ user }, company] = await Promise.all([
+    getAuthSession(),
+    getDomainCompany(domain),
+  ]);
 
   if (!user) {
     redirect(`/${domain}`);
   }
 
-  const { data: company } = await supabase
-    .from("companies")
-    .select("name")
-    .eq("domain", domain)
-    .single();
+  const companyName = company?.name ?? domain;
 
-  const companyName = (company as { name: string } | null)?.name ?? domain;
+  const [{ funnel, recentLeads }, kanban] = company
+    ? await Promise.all([getDashboardData(company.id), getKanbanData(company.id)])
+    : [
+        { funnel: [], recentLeads: [] },
+        {
+          leads: [],
+          operators: [],
+          stages: [],
+          specialties: [],
+          lastActivityByLead: {},
+        },
+      ];
 
-  return <DashboardContent domain={domain} companyName={companyName} />;
+  return (
+    <DashboardContent
+      domain={domain}
+      companyName={companyName}
+      initialFunnel={funnel}
+      initialRecentLeads={recentLeads}
+      initialKanbanLeads={kanban.leads}
+      initialOperators={kanban.operators}
+      initialStages={kanban.stages}
+      initialSpecialties={kanban.specialties}
+      initialLastActivity={kanban.lastActivityByLead}
+    />
+  );
 }

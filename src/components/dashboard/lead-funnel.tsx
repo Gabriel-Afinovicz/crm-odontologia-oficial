@@ -29,12 +29,17 @@ const statusConfig: Record<
   perdido: { label: "Perdidos", color: "text-red-700", bg: "bg-red-50" },
 };
 
-export function LeadFunnel() {
+interface LeadFunnelProps {
+  initialData?: LeadFunnelType[];
+}
+
+export function LeadFunnel({ initialData }: LeadFunnelProps = {}) {
   const { companyId, loading: companyLoading } = useCurrentCompany();
-  const [data, setData] = useState<LeadFunnelType[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<LeadFunnelType[]>(initialData ?? []);
+  const [loading, setLoading] = useState(initialData === undefined);
 
   useEffect(() => {
+    if (initialData !== undefined) return;
     if (companyLoading) return;
     if (!companyId) {
       setData([]);
@@ -54,7 +59,7 @@ export function LeadFunnel() {
     }
 
     fetchFunnel();
-  }, [companyLoading, companyId]);
+  }, [companyLoading, companyId, initialData]);
 
   if (loading) {
     return (

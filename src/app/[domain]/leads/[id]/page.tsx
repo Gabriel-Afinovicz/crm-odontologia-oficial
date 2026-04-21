@@ -1,5 +1,10 @@
 import { redirect, notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { getAuthSession, getDomainCompany } from "@/lib/supabase/cached-data";
+import {
+  getLeadActivities,
+  getLeadSidebarData,
+} from "@/lib/supabase/dashboard-data";
 import type { LeadDetailed } from "@/lib/types/database";
 import { LeadHeader } from "@/components/leads/lead-header";
 import { LeadInfo } from "@/components/leads/lead-info";
@@ -14,40 +19,39 @@ interface LeadDetailPageProps {
 
 export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
   const { domain, id } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const [{ user }, company] = await Promise.all([
+    getAuthSession(),
+    getDomainCompany(domain),
+  ]);
 
   if (!user) {
     redirect(`/${domain}`);
   }
 
-  const { data: company } = await supabase
-    .from("companies")
-    .select("id")
-    .eq("domain", domain)
-    .single();
-
-  const companyId = (company as { id: string } | null)?.id;
+  const companyId = company?.id;
 
   if (!companyId) {
     redirect(`/${domain}`);
   }
 
-  const { data: lead, error } = await supabase
-    .from("vw_leads_detailed")
-    .select("*")
-    .eq("id", id)
-    .eq("company_id", companyId)
-    .single();
+  const supabase = await createClient();
 
-  if (error || !lead) {
+  const [leadRes, activities, sidebar] = await Promise.all([
+    supabase
+      .from("vw_leads_detailed")
+      .select("*")
+      .eq("id", id)
+      .eq("company_id", companyId)
+      .single(),
+    getLeadActivities(companyId, id),
+    getLeadSidebarData(companyId, id),
+  ]);
+
+  if (leadRes.error || !leadRes.data) {
     notFound();
   }
 
-  const typedLead = lead as unknown as LeadDetailed;
+  const typedLead = leadRes.data as unknown as LeadDetailed;
 
   return (
     <div className="p-6 lg:p-8">
@@ -62,8 +66,16 @@ export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
         {/* Left column: info + tags */}
         <div className="space-y-6 lg:col-span-1">
           <LeadInfo lead={typedLead} />
-          <LeadTags leadId={typedLead.id} />
-          <LeadCustomFields leadId={typedLead.id} />
+          <LeadTags
+            leadId={typedLead.id}
+            initialAllTags={sidebar.allTags}
+            initialAssignedTags={sidebar.assignedTags}
+          />
+          <LeadCustomFields
+            leadId={typedLead.id}
+            initialFields={sidebar.customFields}
+            initialValues={sidebar.customFieldValues}
+          />
         </div>
 
         {/* Right column: timeline + add note */}
@@ -72,7 +84,7 @@ export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
             <h3 className="mb-4 text-sm font-semibold uppercase tracking-wider text-gray-400">
               Atividades
             </h3>
-            <LeadTimeline leadId={typedLead.id} />
+            <LeadTimeline leadId={typedLead.id} initialActivities={activities} />
           </div>
 
           <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">

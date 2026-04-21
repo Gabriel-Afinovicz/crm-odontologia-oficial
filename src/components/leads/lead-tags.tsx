@@ -8,6 +8,8 @@ import type { Tag } from "@/lib/types/database";
 
 interface LeadTagsProps {
   leadId: string;
+  initialAllTags?: Tag[];
+  initialAssignedTags?: Tag[];
 }
 
 const PRESET_COLORS = [
@@ -15,11 +17,17 @@ const PRESET_COLORS = [
   "#ec4899", "#06b6d4", "#f97316", "#6366f1", "#14b8a6",
 ];
 
-export function LeadTags({ leadId }: LeadTagsProps) {
+export function LeadTags({
+  leadId,
+  initialAllTags,
+  initialAssignedTags,
+}: LeadTagsProps) {
   const { companyId } = useCurrentCompany();
-  const [tags, setTags] = useState<Tag[]>([]);
-  const [allTags, setAllTags] = useState<Tag[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [tags, setTags] = useState<Tag[]>(initialAssignedTags ?? []);
+  const [allTags, setAllTags] = useState<Tag[]>(initialAllTags ?? []);
+  const [loading, setLoading] = useState(
+    initialAllTags === undefined || initialAssignedTags === undefined
+  );
   const [showPicker, setShowPicker] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [newName, setNewName] = useState("");
@@ -54,10 +62,13 @@ export function LeadTags({ leadId }: LeadTagsProps) {
   }
 
   useEffect(() => {
+    if (initialAllTags !== undefined && initialAssignedTags !== undefined) {
+      return;
+    }
     if (!companyId) return;
     fetchData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leadId, companyId]);
+  }, [leadId, companyId, initialAllTags, initialAssignedTags]);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {

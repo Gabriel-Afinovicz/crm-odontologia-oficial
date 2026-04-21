@@ -21,15 +21,17 @@ const statusBadge: Record<string, { label: string; classes: string }> = {
 
 interface RecentLeadsProps {
   domain: string;
+  initialLeads?: Lead[];
 }
 
-export function RecentLeads({ domain }: RecentLeadsProps) {
+export function RecentLeads({ domain, initialLeads }: RecentLeadsProps) {
   const router = useRouter();
   const { companyId, loading: companyLoading } = useCurrentCompany();
-  const [leads, setLeads] = useState<Lead[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [leads, setLeads] = useState<Lead[]>(initialLeads ?? []);
+  const [loading, setLoading] = useState(initialLeads === undefined);
 
   useEffect(() => {
+    if (initialLeads !== undefined) return;
     if (companyLoading) return;
     if (!companyId) {
       setLeads([]);
@@ -51,7 +53,7 @@ export function RecentLeads({ domain }: RecentLeadsProps) {
     }
 
     fetchLeads();
-  }, [companyLoading, companyId]);
+  }, [companyLoading, companyId, initialLeads]);
 
   if (loading) {
     return (

@@ -1,5 +1,6 @@
 import { redirect, notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { getAuthSession, getDomainCompany } from "@/lib/supabase/cached-data";
 import { LeadForm } from "@/components/leads/lead-form";
 import type { Lead } from "@/lib/types/database";
 import Link from "next/link";
@@ -10,27 +11,22 @@ interface EditLeadPageProps {
 
 export default async function EditLeadPage({ params }: EditLeadPageProps) {
   const { domain, id } = await params;
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const [{ user }, company] = await Promise.all([
+    getAuthSession(),
+    getDomainCompany(domain),
+  ]);
 
   if (!user) {
     redirect(`/${domain}`);
   }
 
-  const { data: company } = await supabase
-    .from("companies")
-    .select("id")
-    .eq("domain", domain)
-    .single();
-
-  const companyId = (company as { id: string } | null)?.id;
+  const companyId = company?.id;
 
   if (!companyId) {
     redirect(`/${domain}`);
   }
+
+  const supabase = await createClient();
 
   const { data: lead, error } = await supabase
     .from("leads")
