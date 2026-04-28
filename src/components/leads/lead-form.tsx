@@ -8,11 +8,13 @@ import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { Lead, LeadSource, Specialty, User } from "@/lib/types/database";
-import { PhotoUploader } from "./photo-uploader";
 
 interface LeadFormProps {
   domain: string;
   lead?: Lead | null;
+  submitMode?: "navigate" | "stay";
+  onSaved?: (lead: Lead) => void;
+  onCancelAction?: () => void;
 }
 
 function Section({
@@ -61,7 +63,13 @@ function Section({
   );
 }
 
-export function LeadForm({ domain, lead }: LeadFormProps) {
+export function LeadForm({
+  domain,
+  lead,
+  submitMode = "navigate",
+  onSaved,
+  onCancelAction,
+}: LeadFormProps) {
   const router = useRouter();
   const { companyId } = useCurrentCompany();
   const isEditing = !!lead;
@@ -74,7 +82,6 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
   const [specialtyId, setSpecialtyId] = useState(lead?.specialty_id || "");
   const [notes, setNotes] = useState(lead?.notes || "");
 
-  const [photoUrl, setPhotoUrl] = useState(lead?.photo_url || null);
   const [birthdate, setBirthdate] = useState(lead?.birthdate || "");
   const [gender, setGender] = useState(lead?.gender || "");
   const [guardianName, setGuardianName] = useState(lead?.guardian_name || "");
@@ -153,7 +160,6 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
       assigned_to: assignedTo || null,
       specialty_id: specialtyId || null,
       notes: notes.trim() || null,
-      photo_url: photoUrl,
       birthdate: birthdate || null,
       gender: gender || null,
       guardian_name: guardianName.trim() || null,
@@ -163,14 +169,22 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
     };
 
     if (isEditing && lead) {
-      const { error: updateError } = await supabase
+      const { data: updated, error: updateError } = await supabase
         .from("leads")
         .update(payload)
-        .eq("id", lead.id);
+        .eq("id", lead.id)
+        .select("*")
+        .single();
 
       if (updateError) {
         setError(`Erro ao atualizar: ${updateError.message}`);
         setSaving(false);
+        return;
+      }
+
+      if (submitMode === "stay") {
+        setSaving(false);
+        onSaved?.((updated as unknown as Lead) ?? { ...lead, ...payload });
         return;
       }
 
@@ -202,14 +216,6 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
       )}
 
       <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm space-y-4">
-        <PhotoUploader
-          companyId={companyId}
-          leadId={lead?.id ?? null}
-          value={photoUrl}
-          name={name}
-          onChange={setPhotoUrl}
-        />
-
         <Input
           label="Nome *"
           placeholder="Nome do paciente"
@@ -344,7 +350,7 @@ export function LeadForm({ domain, lead }: LeadFormProps) {
         </button>
         <button
           type="button"
-          onClick={() => router.back()}
+          onClick={() => (onCancelAction ? onCancelAction() : router.back())}
           className="rounded-lg border border-gray-200 px-5 py-2.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
         >
           Cancelar

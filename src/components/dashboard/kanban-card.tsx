@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { useRef } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { KanbanLead } from "@/lib/supabase/dashboard-data";
@@ -10,6 +10,7 @@ interface KanbanCardProps {
   domain: string;
   isOverlay?: boolean;
   lastActivityAt?: string | null;
+  onOpenEdit?: (leadId: string) => void;
 }
 
 function formatRelative(iso: string) {
@@ -48,9 +49,9 @@ function ageFromBirthdate(bd: string | null): number | null {
 
 export function KanbanCard({
   lead,
-  domain,
   isOverlay,
   lastActivityAt,
+  onOpenEdit,
 }: KanbanCardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({
@@ -63,6 +64,28 @@ export function KanbanCard({
     transition,
   };
 
+  const pointerStart = useRef<{ x: number; y: number } | null>(null);
+  const movedBeyondThreshold = useRef(false);
+
+  function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    pointerStart.current = { x: e.clientX, y: e.clientY };
+    movedBeyondThreshold.current = false;
+  }
+
+  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!pointerStart.current) return;
+    const dx = e.clientX - pointerStart.current.x;
+    const dy = e.clientY - pointerStart.current.y;
+    if (dx * dx + dy * dy > 36) {
+      movedBeyondThreshold.current = true;
+    }
+  }
+
+  function handleClick() {
+    if (movedBeyondThreshold.current || isDragging) return;
+    onOpenEdit?.(lead.id);
+  }
+
   const referenceActivity = lastActivityAt ?? lead.updated_at ?? lead.created_at;
   const inactive = daysSince(referenceActivity) >= 30;
   const age = ageFromBirthdate(lead.birthdate);
@@ -72,58 +95,37 @@ export function KanbanCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`group relative rounded-lg border border-gray-200 bg-white p-3 shadow-sm transition-shadow
+      {...attributes}
+      {...listeners}
+      onPointerDownCapture={handlePointerDown}
+      onPointerMoveCapture={handlePointerMove}
+      onClick={handleClick}
+      role="button"
+      tabIndex={0}
+      className={`group relative cursor-grab touch-none select-none rounded-lg border border-gray-200 bg-white p-3 shadow-sm transition-shadow active:cursor-grabbing
         ${isDragging ? "opacity-40" : "hover:shadow-md"}
         ${isOverlay ? "rotate-1 shadow-lg ring-2 ring-blue-400/40" : ""}`}
     >
-      <div
-        {...attributes}
-        {...listeners}
-        className="absolute inset-0 cursor-grab active:cursor-grabbing"
-        aria-label={`Arrastar ${lead.name}`}
-      />
-
-      <div className="relative flex items-start gap-2.5">
-        <div className="shrink-0">
-          {lead.photo_url ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={lead.photo_url}
-              alt={lead.name}
-              className="h-9 w-9 rounded-full object-cover ring-1 ring-gray-200"
-            />
-          ) : (
-            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-blue-100 to-indigo-100 text-xs font-semibold text-indigo-700 ring-1 ring-white">
-              {initials(lead.name) || "?"}
-            </span>
-          )}
-        </div>
-
-        <div className="flex-1 min-w-0">
-          <div className="flex items-start justify-between gap-2">
-            <Link
-              href={`/${domain}/leads/${lead.id}`}
-              className="flex-1 truncate text-sm font-medium text-gray-900 hover:text-blue-600"
-              onClick={(e) => e.stopPropagation()}
-              onPointerDown={(e) => e.stopPropagation()}
-            >
-              {lead.name}
-            </Link>
-            <span className="shrink-0 text-[10px] uppercase tracking-wide text-gray-400">
-              {formatRelative(lead.updated_at ?? lead.created_at)}
-            </span>
-          </div>
-
-          <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500">
-            {age !== null && <span>{age} anos</span>}
-            {(lead.phone || lead.email) && (
-              <span className="truncate">· {lead.phone ?? lead.email}</span>
-            )}
-          </div>
-        </div>
+      <div className="flex items-start justify-between gap-2">
+        <span className="flex-1 truncate text-sm font-medium text-gray-900">
+          {lead.name}
+        </span>
+        <span className="shrink-0 text-[10px] uppercase tracking-wide text-gray-400">
+          {formatRelative(lead.updated_at ?? lead.created_at)}
+        </span>
       </div>
 
-      <div className="relative mt-2 flex flex-wrap items-center gap-1.5">
+      <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500">
+        {age !== null && <span>{age} anos</span>}
+        {(lead.phone || lead.email) && (
+          <span className="truncate">
+            {age !== null ? "· " : ""}
+            {lead.phone ?? lead.email}
+          </span>
+        )}
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {lead.specialty_name && (
           <span
             className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium text-white"
@@ -162,7 +164,7 @@ export function KanbanCard({
         )}
       </div>
 
-      <div className="relative mt-2 flex items-center justify-end">
+      <div className="mt-2 flex items-center justify-end">
         {lead.assigned_to_name ? (
           <span
             title={

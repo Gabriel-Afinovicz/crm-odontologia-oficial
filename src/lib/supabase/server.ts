@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
+import { toSessionCookieOptions } from "./cookie-options";
 
 export async function createClient() {
   const cookieStore = await cookies();
@@ -15,7 +16,7 @@ export async function createClient() {
         setAll(cookiesToSet) {
           try {
             cookiesToSet.forEach(({ name, value, options }) =>
-              cookieStore.set(name, value, options)
+              cookieStore.set(name, value, toSessionCookieOptions(options))
             );
           } catch {
             // setAll called from Server Component — safe to ignore.

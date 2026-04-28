@@ -1,5 +1,33 @@
 import { createServerClient } from "@supabase/ssr";
+import { AuthApiError } from "@supabase/supabase-js";
 import { NextResponse, type NextRequest } from "next/server";
+import { toSessionCookieOptions } from "./cookie-options";
+
+function isExpectedAuthError(err: unknown): boolean {
+  if (err instanceof AuthApiError) {
+    if (err.code === "refresh_token_not_found") return true;
+    if (err.status >= 400 && err.status < 500) return true;
+  }
+  if (
+    err &&
+    typeof err === "object" &&
+    "code" in err &&
+    (err as { code?: string }).code === "refresh_token_not_found"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function clearSupabaseAuthCookies(
+  request: NextRequest,
+  response: NextResponse
+) {
+  for (const cookie of request.cookies.getAll()) {
+    if (!cookie.name.startsWith("sb-")) continue;
+    response.cookies.set(cookie.name, "", { path: "/", maxAge: 0 });
+  }
+}
 
 /**
  * Middleware leve: só valida sessão (uma ida ao auth server) e resolve redirects
@@ -26,16 +54,37 @@ export async function updateSession(request: NextRequest) {
           );
           supabaseResponse = NextResponse.next({ request });
           cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
+            supabaseResponse.cookies.set(
+              name,
+              value,
+              toSessionCookieOptions(options)
+            )
           );
         },
       },
     }
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  let user: Awaited<ReturnType<typeof supabase.auth.getUser>>["data"]["user"] =
+    null;
+  try {
+    const result = await supabase.auth.getUser();
+    if (result.error) {
+      if (isExpectedAuthError(result.error)) {
+        clearSupabaseAuthCookies(request, supabaseResponse);
+      } else {
+        console.error("[proxy] supabase.auth.getUser:", result.error);
+      }
+    } else {
+      user = result.data.user;
+    }
+  } catch (err) {
+    if (isExpectedAuthError(err)) {
+      clearSupabaseAuthCookies(request, supabaseResponse);
+    } else {
+      console.error("[proxy] supabase.auth.getUser threw:", err);
+    }
+  }
 
   const { pathname } = request.nextUrl;
   const segments = pathname.split("/").filter(Boolean);

@@ -354,6 +354,26 @@ export interface Database {
         Insert: LeadTag;
         Update: Partial<LeadTag>;
       };
+      user_pipeline_stage_order: {
+        Row: {
+          user_id: string;
+          company_id: string;
+          stage_ids: string[];
+          updated_at: string;
+        };
+        Insert: {
+          user_id: string;
+          company_id: string;
+          stage_ids: string[];
+          updated_at?: string;
+        };
+        Update: Partial<{
+          user_id: string;
+          company_id: string;
+          stage_ids: string[];
+          updated_at: string;
+        }>;
+      };
     };
     Views: {
       vw_lead_funnel: {
@@ -427,6 +447,12 @@ export interface Database {
           p_source_ordered_ids: string[];
           p_specialty_id?: string | null;
           p_lost_reason?: string | null;
+        };
+        Returns: void;
+      };
+      reorder_pipeline_stages: {
+        Args: {
+          p_ordered_ids: string[];
         };
         Returns: void;
       };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -14,7 +14,9 @@ import {
   type DragOverEvent,
 } from "@dnd-kit/core";
 import {
+  SortableContext,
   arrayMove,
+  horizontalListSortingStrategy,
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
 import { createClient } from "@/lib/supabase/client";
@@ -23,11 +25,12 @@ import type {
   KanbanLead,
   KanbanOperator,
 } from "@/lib/supabase/dashboard-data";
-import { KanbanColumn, type LaneCell } from "./kanban-column";
+import { KanbanColumn, columnSortableId, type LaneCell } from "./kanban-column";
 import { KanbanCard } from "./kanban-card";
 import { LostReasonModal } from "./lost-reason-modal";
+import { KanbanLeadEditModal } from "./kanban-lead-edit-modal";
 
-type LaneMode = "none" | "specialty" | "dentist";
+type LaneMode = "none" | "dentist";
 
 interface LeadKanbanBoardProps {
   domain: string;
@@ -76,12 +79,13 @@ export function LeadKanbanBoard({
   domain,
   initialLeads,
   operators,
-  stages,
+  stages: initialStages,
   specialties,
   lastActivityByLead,
 }: LeadKanbanBoardProps) {
+  const [stages, setStages] = useState<PipelineStage[]>(initialStages);
   const [board, setBoard] = useState<BoardState>(() =>
-    groupByStage(initialLeads, stages)
+    groupByStage(initialLeads, initialStages)
   );
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pendingLost, setPendingLost] = useState<{
@@ -94,6 +98,8 @@ export function LeadKanbanBoard({
     snapshot: BoardState;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editingLeadId, setEditingLeadId] = useState<string | null>(null);
+  const dragSourceStageIdRef = useRef<string | null>(null);
 
   const [search, setSearch] = useState("");
   const [assigneeFilter, setAssigneeFilter] = useState<string>("all");
@@ -167,21 +173,6 @@ export function LeadKanbanBoard({
         },
       ];
     }
-    if (laneMode === "specialty") {
-      const cells: LaneCell[] = specialties.map((s) => ({
-        laneKey: s.id,
-        laneLabel: s.name,
-        laneColor: s.color,
-        leads: leads.filter((l) => l.specialty_id === s.id),
-      }));
-      cells.push({
-        laneKey: "none",
-        laneLabel: "Sem especialidade",
-        laneColor: "#9ca3af",
-        leads: leads.filter((l) => !l.specialty_id),
-      });
-      return cells;
-    }
     // dentist
     const pool = dentists.length > 0 ? dentists : operators;
     const cells: LaneCell[] = pool.map((u) => ({
@@ -244,13 +235,20 @@ export function LeadKanbanBoard({
   }
 
   function handleDragStart(event: DragStartEvent) {
-    setActiveId(String(event.active.id));
+    const id = String(event.active.id);
+    setActiveId(id);
     setError(null);
+    if (event.active.data.current?.type === "column") {
+      dragSourceStageIdRef.current = null;
+      return;
+    }
+    dragSourceStageIdRef.current = findStageOf(id);
   }
 
   function handleDragOver(event: DragOverEvent) {
     const { active, over } = event;
     if (!over) return;
+    if (active.data.current?.type !== "card") return;
 
     const activeIdStr = String(active.id);
     const overIdStr = String(over.id);
@@ -313,14 +311,56 @@ export function LeadKanbanBoard({
     return s;
   }
 
+  async function persistStageOrder(orderedIds: string[]) {
+    const supabase = createClient();
+    const { error: rpcError } = await supabase.rpc("reorder_pipeline_stages", {
+      p_ordered_ids: orderedIds,
+    });
+    if (rpcError) {
+      throw rpcError;
+    }
+  }
+
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     setActiveId(null);
+    const originStageId = dragSourceStageIdRef.current;
+    dragSourceStageIdRef.current = null;
     if (!over) return;
+
+    if (active.data.current?.type === "column") {
+      const activeStageId = String(active.data.current?.stageId ?? "");
+      const overStageId = String(over.data.current?.stageId ?? "");
+      if (!activeStageId || !overStageId || activeStageId === overStageId) {
+        return;
+      }
+      const oldIndex = stages.findIndex((s) => s.id === activeStageId);
+      const newIndex = stages.findIndex((s) => s.id === overStageId);
+      if (oldIndex === -1 || newIndex === -1) return;
+      const snapshot = stages;
+      const reordered = arrayMove(stages, oldIndex, newIndex).map((s, i) => ({
+        ...s,
+        position: i,
+      }));
+      setStages(reordered);
+      void persistStageOrder(reordered.map((s) => s.id)).catch((err) => {
+        setStages(snapshot);
+        const msg =
+          err && typeof err === "object" && "message" in err
+            ? String((err as { message?: string }).message)
+            : "";
+        setError(
+          msg
+            ? `Falha ao reordenar colunas: ${msg}`
+            : "Falha ao reordenar colunas. Alterações revertidas."
+        );
+      });
+      return;
+    }
 
     const activeIdStr = String(active.id);
     const overIdStr = String(over.id);
-    const fromStageId = findStageOf(activeIdStr);
+    const fromStageId = originStageId ?? findStageOf(activeIdStr);
     const target = resolveTargetStage(overIdStr);
     if (!fromStageId || !target) return;
 
@@ -328,10 +368,7 @@ export function LeadKanbanBoard({
     const toStageId = target.stageId;
     const toStage = stageById.get(toStageId);
 
-    let specialtyToSet: string | null = null;
-    if (target.laneKey && laneMode === "specialty") {
-      specialtyToSet = target.laneKey === "none" ? null : target.laneKey;
-    }
+    const specialtyToSet: string | null = null;
 
     if (fromStageId === toStageId) {
       const items = board[fromStageId];
@@ -437,6 +474,7 @@ export function LeadKanbanBoard({
 
   function handleDragCancel() {
     setActiveId(null);
+    dragSourceStageIdRef.current = null;
   }
 
   const stats = useMemo(() => {
@@ -512,7 +550,7 @@ export function LeadKanbanBoard({
         </select>
 
         <div className="inline-flex rounded-lg border border-gray-300 bg-white p-0.5 text-xs">
-          {(["none", "specialty", "dentist"] as LaneMode[]).map((mode) => (
+          {(["none", "dentist"] as LaneMode[]).map((mode) => (
             <button
               key={mode}
               type="button"
@@ -523,11 +561,7 @@ export function LeadKanbanBoard({
                   : "text-gray-600 hover:bg-gray-50"
               }`}
             >
-              {mode === "none"
-                ? "Sem raias"
-                : mode === "specialty"
-                  ? "Raias por especialidade"
-                  : "Raias por dentista"}
+              {mode === "none" ? "Sem raias" : "Raias por Dentista/Operador"}
             </button>
           ))}
         </div>
@@ -584,6 +618,7 @@ export function LeadKanbanBoard({
       )}
 
       <DndContext
+        id="lead-kanban"
         sensors={sensors}
         collisionDetection={closestCorners}
         onDragStart={handleDragStart}
@@ -591,19 +626,25 @@ export function LeadKanbanBoard({
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
       >
-        <div className="flex gap-3 overflow-x-auto pb-2 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300">
-          {columns.map((col) => (
-            <KanbanColumn
-              key={col.stage.id}
-              stage={col.stage}
-              cells={col.cells}
-              totalCount={col.totalCount}
-              domain={domain}
-              lastActivityByLead={lastActivityByLead}
-              showLaneLabel={laneMode !== "none"}
-            />
-          ))}
-        </div>
+        <SortableContext
+          items={stages.map((s) => columnSortableId(s.id))}
+          strategy={horizontalListSortingStrategy}
+        >
+          <div className="flex gap-3 overflow-x-auto pb-2 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300">
+            {columns.map((col) => (
+              <KanbanColumn
+                key={col.stage.id}
+                stage={col.stage}
+                cells={col.cells}
+                totalCount={col.totalCount}
+                domain={domain}
+                lastActivityByLead={lastActivityByLead}
+                showLaneLabel={laneMode !== "none"}
+                onOpenEdit={setEditingLeadId}
+              />
+            ))}
+          </div>
+        </SortableContext>
 
         <DragOverlay dropAnimation={null}>
           {activeLead ? (
@@ -611,6 +652,26 @@ export function LeadKanbanBoard({
           ) : null}
         </DragOverlay>
       </DndContext>
+
+      {editingLeadId && (
+        <KanbanLeadEditModal
+          domain={domain}
+          leadId={editingLeadId}
+          onClose={() => setEditingLeadId(null)}
+          onSaved={(updated) => {
+            setBoard((prev) => {
+              const next: BoardState = {};
+              for (const stageId of Object.keys(prev)) {
+                next[stageId] = prev[stageId].map((l) =>
+                  l.id === updated.id ? { ...l, ...updated } : l
+                );
+              }
+              return next;
+            });
+            setEditingLeadId(null);
+          }}
+        />
+      )}
 
       {pendingLost && (
         <LostReasonModal

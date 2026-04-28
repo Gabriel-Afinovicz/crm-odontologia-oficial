@@ -90,6 +90,7 @@ export function WosniczLoginForm() {
   return (
     <form onSubmit={handleSubmit} className="space-y-5">
       <Input
+        variant="dark"
         label="Ramal"
         type="text"
         placeholder="Ramal do Super Admin"
@@ -101,6 +102,7 @@ export function WosniczLoginForm() {
       />
 
       <Input
+        variant="dark"
         label="Senha"
         type="password"
         placeholder="••••••"

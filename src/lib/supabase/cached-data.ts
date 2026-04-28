@@ -1,7 +1,23 @@
 import { cache } from "react";
-import type { User } from "@supabase/supabase-js";
+import { AuthApiError, type User } from "@supabase/supabase-js";
 import { createClient } from "./server";
 import type { User as AppUser } from "@/lib/types/database";
+
+function isExpectedAuthError(err: unknown): boolean {
+  if (err instanceof AuthApiError) {
+    if (err.code === "refresh_token_not_found") return true;
+    if (err.status >= 400 && err.status < 500) return true;
+  }
+  if (
+    err &&
+    typeof err === "object" &&
+    "code" in err &&
+    (err as { code?: string }).code === "refresh_token_not_found"
+  ) {
+    return true;
+  }
+  return false;
+}
 
 export type AuthSession = {
   user: User | null;
@@ -14,9 +30,22 @@ export type AuthSession = {
 /** Uma sessão por requisição RSC (deduplica layout + páginas na mesma navegação). */
 export const getAuthSession = cache(async (): Promise<AuthSession> => {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+
+  let user: User | null = null;
+  try {
+    const result = await supabase.auth.getUser();
+    if (result.error) {
+      if (!isExpectedAuthError(result.error)) {
+        console.error("[auth] getAuthSession.getUser:", result.error);
+      }
+    } else {
+      user = result.data.user;
+    }
+  } catch (err) {
+    if (!isExpectedAuthError(err)) {
+      console.error("[auth] getAuthSession.getUser threw:", err);
+    }
+  }
 
   if (!user) {
     return { user: null, profile: null, role: null, userDomain: null };

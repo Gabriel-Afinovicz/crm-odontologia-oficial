@@ -77,40 +77,57 @@ export type KanbanOperator = Pick<User, "id" | "name" | "is_dentist">;
 export const getKanbanData = cache(async (companyId: string) => {
   const supabase = await createClient();
 
-  const [leadsRes, operatorsRes, stagesRes, specialtiesRes, lastActivityRes] =
-    await Promise.all([
-      supabase
-        .from("vw_leads_detailed")
-        .select(
-          "id,name,status,stage_id,specialty_id,specialty_name,specialty_color,phone,email,assigned_to,assigned_to_name,assigned_is_dentist,source_name,kanban_position,photo_url,birthdate,allergies,created_at,updated_at"
-        )
-        .eq("company_id", companyId)
-        .order("kanban_position", { ascending: true })
-        .order("created_at", { ascending: false }),
-      supabase
-        .from("users")
-        .select("id, name, is_dentist")
-        .eq("company_id", companyId)
-        .eq("is_active", true)
-        .order("name"),
-      supabase
-        .from("pipeline_stages")
-        .select("*")
-        .eq("company_id", companyId)
-        .eq("is_active", true)
-        .order("position", { ascending: true }),
-      supabase
-        .from("specialties")
-        .select("*")
-        .eq("company_id", companyId)
-        .eq("is_active", true)
-        .order("name", { ascending: true }),
-      supabase
-        .from("activities")
-        .select("lead_id, created_at")
-        .eq("company_id", companyId)
-        .order("created_at", { ascending: false }),
-    ]);
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  const [
+    leadsRes,
+    operatorsRes,
+    stagesRes,
+    specialtiesRes,
+    lastActivityRes,
+    userStageOrderRes,
+  ] = await Promise.all([
+    supabase
+      .from("vw_leads_detailed")
+      .select(
+        "id,name,status,stage_id,specialty_id,specialty_name,specialty_color,phone,email,assigned_to,assigned_to_name,assigned_is_dentist,source_name,kanban_position,photo_url,birthdate,allergies,created_at,updated_at"
+      )
+      .eq("company_id", companyId)
+      .order("kanban_position", { ascending: true })
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("users")
+      .select("id, name, is_dentist")
+      .eq("company_id", companyId)
+      .eq("is_active", true)
+      .order("name"),
+    supabase
+      .from("pipeline_stages")
+      .select("*")
+      .eq("company_id", companyId)
+      .eq("is_active", true)
+      .order("position", { ascending: true }),
+    supabase
+      .from("specialties")
+      .select("*")
+      .eq("company_id", companyId)
+      .eq("is_active", true)
+      .order("name", { ascending: true }),
+    supabase
+      .from("activities")
+      .select("lead_id, created_at")
+      .eq("company_id", companyId)
+      .order("created_at", { ascending: false }),
+    user
+      ? supabase
+          .from("user_pipeline_stage_order")
+          .select("stage_ids")
+          .eq("user_id", user.id)
+          .maybeSingle()
+      : Promise.resolve({ data: null }),
+  ]);
 
   const lastActivityMap = new Map<string, string>();
   const rows =
@@ -122,10 +139,34 @@ export const getKanbanData = cache(async (companyId: string) => {
     }
   }
 
+  const rawStages = (stagesRes.data as unknown as PipelineStage[]) ?? [];
+  const userOrder =
+    (userStageOrderRes.data as { stage_ids: string[] } | null)?.stage_ids ?? null;
+
+  let stages: PipelineStage[];
+  if (userOrder && userOrder.length > 0) {
+    const byId = new Map(rawStages.map((s) => [s.id, s] as const));
+    const ordered: PipelineStage[] = [];
+    const seen = new Set<string>();
+    for (const id of userOrder) {
+      const stage = byId.get(id);
+      if (stage) {
+        ordered.push(stage);
+        seen.add(id);
+      }
+    }
+    for (const s of rawStages) {
+      if (!seen.has(s.id)) ordered.push(s);
+    }
+    stages = ordered;
+  } else {
+    stages = rawStages;
+  }
+
   return {
     leads: (leadsRes.data as unknown as KanbanLead[]) ?? [],
     operators: (operatorsRes.data as unknown as KanbanOperator[]) ?? [],
-    stages: (stagesRes.data as unknown as PipelineStage[]) ?? [],
+    stages,
     specialties: (specialtiesRes.data as unknown as Specialty[]) ?? [],
     lastActivityByLead: Object.fromEntries(lastActivityMap) as Record<
       string,
