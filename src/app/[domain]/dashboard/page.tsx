@@ -20,10 +20,10 @@ export default async function DashboardPage({ params }: DashboardPageProps) {
 
   const companyName = company?.name ?? domain;
 
-  const [{ funnel, recentLeads }, kanban] = company
+  const [{ recentLeads }, kanban] = company
     ? await Promise.all([getDashboardData(company.id), getKanbanData(company.id)])
     : [
-        { funnel: [], recentLeads: [] },
+        { recentLeads: [] },
         {
           leads: [],
           operators: [],
@@ -37,7 +37,6 @@ export default async function DashboardPage({ params }: DashboardPageProps) {
     <DashboardContent
       domain={domain}
       companyName={companyName}
-      initialFunnel={funnel}
       initialRecentLeads={recentLeads}
       initialKanbanLeads={kanban.leads}
       initialOperators={kanban.operators}

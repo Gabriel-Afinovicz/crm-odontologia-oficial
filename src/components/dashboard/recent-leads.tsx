@@ -1,30 +1,26 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
-import type { Lead } from "@/lib/types/database";
-
-const statusBadge: Record<string, { label: string; classes: string }> = {
-  novo: { label: "Novo", classes: "bg-blue-100 text-blue-700" },
-  agendado: { label: "Agendado", classes: "bg-yellow-100 text-yellow-700" },
-  atendido: { label: "Atendido", classes: "bg-green-100 text-green-700" },
-  finalizado: {
-    label: "Finalizado",
-    classes: "bg-purple-100 text-purple-700",
-  },
-  perdido: { label: "Perdido", classes: "bg-red-100 text-red-700" },
-};
+import { StageBadge } from "@/components/dashboard/stage-badge";
+import type { Lead, PipelineStage } from "@/lib/types/database";
 
 interface RecentLeadsProps {
   domain: string;
   initialLeads?: Lead[];
+  /**
+   * Lista de etapas do pipeline (na ordem atual do kanban). Quando informada,
+   * a coluna "Status" da tabela exibe a tag da etapa correspondente
+   * (`stage.name`/`stage.color`) em vez do status legado.
+   */
+  stages?: PipelineStage[];
 }
 
-export function RecentLeads({ domain, initialLeads }: RecentLeadsProps) {
+export function RecentLeads({ domain, initialLeads, stages }: RecentLeadsProps) {
   const router = useRouter();
   const { companyId, loading: companyLoading } = useCurrentCompany();
   const [leads, setLeads] = useState<Lead[]>(initialLeads ?? []);
@@ -54,6 +50,12 @@ export function RecentLeads({ domain, initialLeads }: RecentLeadsProps) {
 
     fetchLeads();
   }, [companyLoading, companyId, initialLeads]);
+
+  const stageById = useMemo(() => {
+    const map = new Map<string, PipelineStage>();
+    for (const s of stages ?? []) map.set(s.id, s);
+    return map;
+  }, [stages]);
 
   if (loading) {
     return (
@@ -114,7 +116,7 @@ export function RecentLeads({ domain, initialLeads }: RecentLeadsProps) {
           </thead>
           <tbody className="divide-y divide-gray-50">
             {leads.map((lead) => {
-              const badge = statusBadge[lead.status];
+              const stage = stageById.get(lead.stage_id);
               return (
                 <tr
                   key={lead.id}
@@ -136,11 +138,11 @@ export function RecentLeads({ domain, initialLeads }: RecentLeadsProps) {
                     </div>
                   </td>
                   <td className="whitespace-nowrap px-6 py-3">
-                    <span
-                      className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ${badge.classes}`}
-                    >
-                      {badge.label}
-                    </span>
+                    <StageBadge
+                      stageName={stage?.name}
+                      stageColor={stage?.color}
+                      fallbackStatus={lead.status}
+                    />
                   </td>
                   <td className="whitespace-nowrap px-6 py-3 text-gray-500">
                     {new Date(lead.created_at).toLocaleDateString("pt-BR")}

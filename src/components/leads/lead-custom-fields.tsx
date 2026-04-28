@@ -38,9 +38,29 @@ export function LeadCustomFields({
     initialValues ?? []
   );
   const [showAddForm, setShowAddForm] = useState(false);
+  const [missingFields, setMissingFields] = useState<string[]>([]);
 
   const canManageFields =
     profile?.role === "admin" || profile?.role === "super_admin";
+
+  /**
+   * Considera vazio quando o campo obrigatório não recebeu valor utilizável.
+   * `boolean` obrigatório significa "deve estar marcado" (i.e. o usuário
+   * confirmou positivamente o aceite).
+   */
+  function isEmptyValue(field: CustomField, raw: string | undefined): boolean {
+    const value = (raw ?? "").trim();
+    switch (field.field_type) {
+      case "select":
+        return value === "";
+      case "multi_select":
+        return value.split(",").filter(Boolean).length === 0;
+      case "boolean":
+        return value !== "true";
+      default:
+        return value === "";
+    }
+  }
 
   async function fetchFields() {
     if (!companyId) return;
@@ -85,6 +105,9 @@ export function LeadCustomFields({
   function handleChange(fieldId: string, val: string) {
     setValues((prev) => ({ ...prev, [fieldId]: val }));
     setDirty(true);
+    if (missingFields.includes(fieldId)) {
+      setMissingFields((prev) => prev.filter((id) => id !== fieldId));
+    }
   }
 
   async function handleDeleteField(fieldId: string, fieldName: string) {
@@ -118,6 +141,16 @@ export function LeadCustomFields({
 
   async function handleSave() {
     if (!companyId) return;
+
+    const missing = fields
+      .filter((f) => f.is_required && isEmptyValue(f, values[f.id]))
+      .map((f) => f.id);
+    if (missing.length > 0) {
+      setMissingFields(missing);
+      return;
+    }
+
+    setMissingFields([]);
     setSaving(true);
     const supabase = createClient();
 
@@ -212,6 +245,16 @@ export function LeadCustomFields({
         </p>
       ) : (
         <>
+          {missingFields.length > 0 && (
+            <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+              Preencha os campos obrigatórios:{" "}
+              {fields
+                .filter((f) => missingFields.includes(f.id))
+                .map((f) => f.name)
+                .join(", ")}
+              .
+            </div>
+          )}
           <div className="space-y-3">
             {fields.map((field) => (
               <div key={field.id} className="group relative">
@@ -219,6 +262,7 @@ export function LeadCustomFields({
                   field={field}
                   value={values[field.id] || ""}
                   onChange={(val) => handleChange(field.id, val)}
+                  hasError={missingFields.includes(field.id)}
                 />
                 {canManageFields && (
                   <button
@@ -266,13 +310,20 @@ function FieldRenderer({
   field,
   value,
   onChange,
+  hasError = false,
 }: {
   field: CustomField;
   value: string;
   onChange: (val: string) => void;
+  hasError?: boolean;
 }) {
-  const inputClass =
-    "w-full rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20";
+  const baseInputClass =
+    "w-full rounded-lg border px-3 py-1.5 text-sm text-gray-900 focus:outline-none focus:ring-2";
+  const inputClass = `${baseInputClass} ${
+    hasError
+      ? "border-red-400 focus:border-red-500 focus:ring-red-500/20"
+      : "border-gray-300 focus:border-blue-500 focus:ring-blue-500/20"
+  }`;
 
   const options: string[] = Array.isArray(field.options) ? field.options : [];
 

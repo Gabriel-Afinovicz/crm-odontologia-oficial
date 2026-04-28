@@ -18,20 +18,10 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { createClient } from "@/lib/supabase/client";
 import { useCurrentCompany } from "@/hooks/use-current-company";
+import { PIPELINE_STAGE_COLORS } from "@/lib/pipeline-stage-colors";
 import type { PipelineStage } from "@/lib/types/database";
 
-const PRESET_COLORS = [
-  "#3b82f6",
-  "#22c55e",
-  "#f59e0b",
-  "#ef4444",
-  "#8b5cf6",
-  "#ec4899",
-  "#06b6d4",
-  "#f97316",
-  "#16a34a",
-  "#64748b",
-];
+const PRESET_COLORS = PIPELINE_STAGE_COLORS;
 
 function StageRow({
   stage,
@@ -157,7 +147,7 @@ export function PipelineStagesManager() {
   const [operatingId, setOperatingId] = useState<string | null>(null);
 
   const [newName, setNewName] = useState("");
-  const [newColor, setNewColor] = useState(PRESET_COLORS[0]);
+  const [newColor, setNewColor] = useState<string>(PRESET_COLORS[0]);
   const [saving, setSaving] = useState(false);
 
   const [editing, setEditing] = useState<PipelineStage | null>(null);

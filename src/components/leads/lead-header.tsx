@@ -4,37 +4,24 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
-import type {
-  LeadStatus,
-  ProcedureType,
-  Room,
-  User,
-} from "@/lib/types/database";
-import { StatusBadge } from "@/components/ui/badge";
+import type { ProcedureType, Room, User } from "@/lib/types/database";
 import { BookAppointmentModal } from "@/components/agenda/book-appointment-modal";
 import { useCurrentCompany } from "@/hooks/use-current-company";
-
-const STATUSES: { value: LeadStatus; label: string }[] = [
-  { value: "novo", label: "Novo" },
-  { value: "agendado", label: "Agendado" },
-  { value: "atendido", label: "Atendido" },
-  { value: "finalizado", label: "Finalizado" },
-  { value: "perdido", label: "Perdido" },
-];
 
 interface LeadHeaderProps {
   leadId: string;
   leadName: string;
-  status: LeadStatus;
   domain: string;
 }
 
-export function LeadHeader({ leadId, leadName, status, domain }: LeadHeaderProps) {
+/**
+ * Cabeçalho do detalhe do lead. O status agora é gerido exclusivamente
+ * pelas etapas dinâmicas do kanban (sem dropdown legado de
+ * Novo/Agendado/.../Perdido).
+ */
+export function LeadHeader({ leadId, leadName, domain }: LeadHeaderProps) {
   const router = useRouter();
   const { companyId } = useCurrentCompany();
-  const [currentStatus, setCurrentStatus] = useState(status);
-  const [changing, setChanging] = useState(false);
-  const [showDropdown, setShowDropdown] = useState(false);
   const [showBook, setShowBook] = useState(false);
   const [agendaResources, setAgendaResources] = useState<{
     rooms: Room[];
@@ -78,27 +65,6 @@ export function LeadHeader({ leadId, leadName, status, domain }: LeadHeaderProps
     })();
   }, [companyId, showBook, agendaResources.rooms.length]);
 
-  async function handleStatusChange(newStatus: LeadStatus) {
-    if (newStatus === currentStatus) {
-      setShowDropdown(false);
-      return;
-    }
-
-    setChanging(true);
-    const supabase = createClient();
-    const { error } = await supabase
-      .from("leads")
-      .update({ status: newStatus })
-      .eq("id", leadId);
-
-    if (!error) {
-      setCurrentStatus(newStatus);
-    }
-    setChanging(false);
-    setShowDropdown(false);
-    router.refresh();
-  }
-
   return (
     <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
       <div className="flex items-center gap-4">
@@ -110,38 +76,7 @@ export function LeadHeader({ leadId, leadName, status, domain }: LeadHeaderProps
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
           </svg>
         </Link>
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">{leadName}</h1>
-          <div className="mt-1 flex items-center gap-2">
-            <div className="relative">
-              <button
-                onClick={() => setShowDropdown(!showDropdown)}
-                disabled={changing}
-                className="flex items-center gap-1 transition-opacity hover:opacity-80 disabled:opacity-50"
-              >
-                <StatusBadge status={currentStatus} />
-                <svg className="h-3 w-3 text-gray-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" />
-                </svg>
-              </button>
-
-              {showDropdown && (
-                <div className="absolute left-0 top-full z-10 mt-1 w-40 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
-                  {STATUSES.map((s) => (
-                    <button
-                      key={s.value}
-                      onClick={() => handleStatusChange(s.value)}
-                      className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors hover:bg-gray-50
-                        ${s.value === currentStatus ? "font-medium text-blue-600" : "text-gray-700"}`}
-                    >
-                      <StatusBadge status={s.value} />
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <h1 className="text-2xl font-bold text-gray-900">{leadName}</h1>
       </div>
 
       <div className="flex items-center gap-2">

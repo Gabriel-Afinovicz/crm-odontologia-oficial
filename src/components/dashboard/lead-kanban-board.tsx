@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -20,6 +20,7 @@ import {
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
 import { createClient } from "@/lib/supabase/client";
+import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { PipelineStage, Specialty } from "@/lib/types/database";
 import type {
   KanbanLead,
@@ -29,6 +30,8 @@ import { KanbanColumn, columnSortableId, type LaneCell } from "./kanban-column";
 import { KanbanCard } from "./kanban-card";
 import { LostReasonModal } from "./lost-reason-modal";
 import { KanbanLeadEditModal } from "./kanban-lead-edit-modal";
+import { AddStageColumn } from "./add-stage-column";
+import { EditStageModal } from "./edit-stage-modal";
 
 type LaneMode = "none" | "dentist";
 
@@ -39,6 +42,19 @@ interface LeadKanbanBoardProps {
   stages: PipelineStage[];
   specialties: Specialty[];
   lastActivityByLead: Record<string, string>;
+  /**
+   * Notifica o pai sempre que o conjunto de leads do board muda
+   * (mover entre etapas, reordenar, editar). Usado para manter
+   * indicadores externos — como o Funil de Leads — sincronizados
+   * com o que o usuário enxerga no kanban.
+   */
+  onLeadsChange?: (leads: KanbanLead[]) => void;
+  /**
+   * Notifica o pai sempre que a ordem das colunas (etapas) muda,
+   * para que outras visualizações (funil, badges em "Últimos leads")
+   * possam refletir a mesma ordenação em tempo real.
+   */
+  onStagesChange?: (stages: PipelineStage[]) => void;
 }
 
 type BoardState = Record<string, KanbanLead[]>;
@@ -82,11 +98,38 @@ export function LeadKanbanBoard({
   stages: initialStages,
   specialties,
   lastActivityByLead,
+  onLeadsChange,
+  onStagesChange,
 }: LeadKanbanBoardProps) {
+  const { companyId } = useCurrentCompany();
   const [stages, setStages] = useState<PipelineStage[]>(initialStages);
   const [board, setBoard] = useState<BoardState>(() =>
     groupByStage(initialLeads, initialStages)
   );
+
+  const onLeadsChangeRef = useRef(onLeadsChange);
+  useEffect(() => {
+    onLeadsChangeRef.current = onLeadsChange;
+  }, [onLeadsChange]);
+
+  useEffect(() => {
+    const cb = onLeadsChangeRef.current;
+    if (!cb) return;
+    const flat: KanbanLead[] = [];
+    for (const stageId of Object.keys(board)) {
+      for (const lead of board[stageId]) flat.push(lead);
+    }
+    cb(flat);
+  }, [board]);
+
+  const onStagesChangeRef = useRef(onStagesChange);
+  useEffect(() => {
+    onStagesChangeRef.current = onStagesChange;
+  }, [onStagesChange]);
+
+  useEffect(() => {
+    onStagesChangeRef.current?.(stages);
+  }, [stages]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pendingLost, setPendingLost] = useState<{
     lead: KanbanLead;
@@ -99,6 +142,7 @@ export function LeadKanbanBoard({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editingLeadId, setEditingLeadId] = useState<string | null>(null);
+  const [editingStage, setEditingStage] = useState<PipelineStage | null>(null);
   const dragSourceStageIdRef = useRef<string | null>(null);
 
   const [search, setSearch] = useState("");
@@ -263,7 +307,12 @@ export function LeadKanbanBoard({
       const dest = prev[target.stageId] ?? [];
       const idx = source.findIndex((l) => l.id === activeIdStr);
       if (idx === -1) return prev;
-      const moving = { ...source[idx], stage_id: target.stageId };
+      const targetStage = stageById.get(target.stageId);
+      const moving: KanbanLead = {
+        ...source[idx],
+        stage_id: target.stageId,
+        status: targetStage?.legacy_status ?? source[idx].status,
+      };
       const overIndex = dest.findIndex((l) => l.id === overIdStr);
       const insertAt = overIndex === -1 ? dest.length : overIndex;
       return {
@@ -626,11 +675,11 @@ export function LeadKanbanBoard({
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
       >
-        <SortableContext
-          items={stages.map((s) => columnSortableId(s.id))}
-          strategy={horizontalListSortingStrategy}
-        >
-          <div className="flex gap-3 overflow-x-auto pb-2 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300">
+        <div className="flex gap-3 overflow-x-auto pb-2 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300">
+          <SortableContext
+            items={stages.map((s) => columnSortableId(s.id))}
+            strategy={horizontalListSortingStrategy}
+          >
             {columns.map((col) => (
               <KanbanColumn
                 key={col.stage.id}
@@ -641,10 +690,28 @@ export function LeadKanbanBoard({
                 lastActivityByLead={lastActivityByLead}
                 showLaneLabel={laneMode !== "none"}
                 onOpenEdit={setEditingLeadId}
+                onEditStage={setEditingStage}
               />
             ))}
-          </div>
-        </SortableContext>
+          </SortableContext>
+          {companyId && (
+            <AddStageColumn
+              companyId={companyId}
+              nextPosition={
+                stages
+                  .filter((s) => !s.is_lost)
+                  .reduce((m, s) => Math.max(m, s.position), 0) + 1
+              }
+              onCreated={(stage) => {
+                setStages((prev) => [...prev, stage]);
+                setBoard((prev) => ({ ...prev, [stage.id]: [] }));
+              }}
+              onError={(message) =>
+                setError(`Falha ao criar etapa: ${message}`)
+              }
+            />
+          )}
+        </div>
 
         <DragOverlay dropAnimation={null}>
           {activeLead ? (
@@ -669,6 +736,31 @@ export function LeadKanbanBoard({
               return next;
             });
             setEditingLeadId(null);
+          }}
+        />
+      )}
+
+      {editingStage && (
+        <EditStageModal
+          stage={editingStage}
+          leadCount={(board[editingStage.id] ?? []).length}
+          onClose={() => setEditingStage(null)}
+          onSaved={(updated) => {
+            setStages((prev) =>
+              prev.map((s) => (s.id === updated.id ? updated : s))
+            );
+            setEditingStage(null);
+          }}
+          onDeleted={(stageId) => {
+            setStages((prev) => prev.filter((s) => s.id !== stageId));
+            setBoard((prev) => {
+              const next: BoardState = {};
+              for (const k of Object.keys(prev)) {
+                if (k !== stageId) next[k] = prev[k];
+              }
+              return next;
+            });
+            setEditingStage(null);
           }}
         />
       )}

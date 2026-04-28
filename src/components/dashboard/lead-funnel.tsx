@@ -1,112 +1,97 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
-import { useCurrentCompany } from "@/hooks/use-current-company";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
-import type { LeadFunnel as LeadFunnelType } from "@/lib/types/database";
 
-const statusConfig: Record<
-  string,
-  { label: string; color: string; bg: string }
-> = {
-  novo: { label: "Novos", color: "text-blue-700", bg: "bg-blue-50" },
-  agendado: {
-    label: "Agendados",
-    color: "text-yellow-700",
-    bg: "bg-yellow-50",
-  },
-  atendido: {
-    label: "Atendidos",
-    color: "text-green-700",
-    bg: "bg-green-50",
-  },
-  finalizado: {
-    label: "Finalizados",
-    color: "text-purple-700",
-    bg: "bg-purple-50",
-  },
-  perdido: { label: "Perdidos", color: "text-red-700", bg: "bg-red-50" },
-};
-
-interface LeadFunnelProps {
-  initialData?: LeadFunnelType[];
+/**
+ * Linha do funil derivada de uma etapa do pipeline.
+ *
+ * O nome e a cor refletem exatamente a coluna correspondente do kanban,
+ * de forma que adicionar/renomear/recolorir uma etapa nas configurações
+ * propaga automaticamente para o funil sem nenhum mapeamento estático.
+ */
+export interface StageFunnelRow {
+  stageId: string;
+  label: string;
+  color: string;
+  total: number;
+  last_7_days: number;
+  last_30_days: number;
 }
 
-export function LeadFunnel({ initialData }: LeadFunnelProps = {}) {
-  const { companyId, loading: companyLoading } = useCurrentCompany();
-  const [data, setData] = useState<LeadFunnelType[]>(initialData ?? []);
-  const [loading, setLoading] = useState(initialData === undefined);
+interface LeadFunnelProps {
+  data: StageFunnelRow[];
+}
 
-  useEffect(() => {
-    if (initialData !== undefined) return;
-    if (companyLoading) return;
-    if (!companyId) {
-      setData([]);
-      setLoading(false);
-      return;
-    }
-
-    async function fetchFunnel() {
-      const supabase = createClient();
-      const { data: funnelData } = await supabase
-        .from("vw_lead_funnel")
-        .select("*")
-        .eq("company_id", companyId!);
-
-      if (funnelData) setData(funnelData as unknown as LeadFunnelType[]);
-      setLoading(false);
-    }
-
-    fetchFunnel();
-  }, [companyLoading, companyId, initialData]);
-
-  if (loading) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Funil de Leads</CardTitle>
-        </CardHeader>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <div key={i} className="h-24 animate-pulse rounded-lg bg-gray-100" />
-          ))}
-        </div>
-      </Card>
-    );
-  }
-
-  const orderedStatuses = ["novo", "agendado", "atendido", "finalizado", "perdido"];
+export function LeadFunnel({ data }: LeadFunnelProps) {
+  /**
+   * Distribuímos as etapas em duas linhas com a mesma quantidade
+   * (ou diferença máxima de 1 quando ímpar). Ambas as linhas usam o
+   * mesmo número de colunas, então a largura dos cards casa entre as
+   * duas linhas mesmo quando a inferior tem um item a menos.
+   */
+  const topCount = Math.ceil(data.length / 2);
+  const topRow = data.slice(0, topCount);
+  const bottomRow = data.slice(topCount);
+  const useTwoRows = data.length >= 2;
+  const colsForGrid = useTwoRows ? topCount : Math.max(1, data.length);
+  const gridStyle = {
+    gridTemplateColumns: `repeat(${colsForGrid}, minmax(0, 1fr))`,
+  };
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Funil de Leads</CardTitle>
       </CardHeader>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        {orderedStatuses.map((status) => {
-          const item = data.find((d) => d.status === status);
-          const config = statusConfig[status];
-
-          return (
-            <div
-              key={status}
-              className={`rounded-lg ${config.bg} p-4 text-center`}
-            >
-              <p className={`text-2xl font-bold ${config.color}`}>
-                {item?.total ?? 0}
-              </p>
-              <p className={`text-sm font-medium ${config.color}`}>
-                {config.label}
-              </p>
-              <div className="mt-2 space-y-0.5 text-xs text-gray-500">
-                <p>7d: {item?.last_7_days ?? 0}</p>
-                <p>30d: {item?.last_30_days ?? 0}</p>
-              </div>
+      {data.length === 0 ? (
+        <p className="text-sm text-gray-500">
+          Nenhuma etapa configurada. Crie colunas no kanban para visualizar o
+          funil.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          <div className="grid gap-3" style={gridStyle}>
+            {topRow.map((row) => (
+              <FunnelCard key={row.stageId} row={row} />
+            ))}
+          </div>
+          {useTwoRows && (
+            <div className="grid gap-3" style={gridStyle}>
+              {bottomRow.map((row) => (
+                <FunnelCard key={row.stageId} row={row} />
+              ))}
             </div>
-          );
-        })}
-      </div>
+          )}
+        </div>
+      )}
     </Card>
+  );
+}
+
+function FunnelCard({ row }: { row: StageFunnelRow }) {
+  return (
+    <div
+      className="flex min-w-0 flex-col rounded-lg border border-gray-200 bg-white p-4 text-center shadow-sm"
+      style={{ borderTopColor: row.color, borderTopWidth: 3 }}
+    >
+      <p className="text-2xl font-bold text-gray-900">{row.total}</p>
+      <div className="mt-1 flex items-center justify-center gap-1.5">
+        <span
+          className="h-2 w-2 shrink-0 rounded-full"
+          style={{ backgroundColor: row.color }}
+          aria-hidden
+        />
+        <p
+          className="truncate text-sm font-medium text-gray-700"
+          title={row.label}
+        >
+          {row.label}
+        </p>
+      </div>
+      <div className="mt-2 space-y-0.5 text-xs text-gray-500">
+        <p>7d: {row.last_7_days}</p>
+        <p>30d: {row.last_30_days}</p>
+      </div>
+    </div>
   );
 }

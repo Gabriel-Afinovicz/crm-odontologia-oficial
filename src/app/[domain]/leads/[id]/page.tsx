@@ -58,7 +58,6 @@ export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
       <LeadHeader
         leadId={typedLead.id}
         leadName={typedLead.name}
-        status={typedLead.status}
         domain={domain}
       />
 

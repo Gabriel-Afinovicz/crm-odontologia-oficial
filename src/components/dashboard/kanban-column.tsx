@@ -56,6 +56,8 @@ interface KanbanColumnProps {
   lastActivityByLead: Record<string, string>;
   showLaneLabel: boolean;
   onOpenEdit?: (leadId: string) => void;
+  /** Acionado pelo botão de "três pontinhos" no topo da coluna. */
+  onEditStage?: (stage: PipelineStage) => void;
 }
 
 function CellDroppable({
@@ -110,6 +112,7 @@ export function KanbanColumn({
   lastActivityByLead,
   showLaneLabel,
   onOpenEdit,
+  onEditStage,
 }: KanbanColumnProps) {
   const [openLanes, setOpenLanes] = useState<Set<string>>(() => new Set());
 
@@ -169,9 +172,32 @@ export function KanbanColumn({
             </span>
           )}
         </div>
-        <span className="rounded-full bg-white px-2 py-0.5 text-xs font-medium text-gray-600">
-          {totalCount}
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span className="rounded-full bg-white px-2 py-0.5 text-xs font-medium text-gray-600">
+            {totalCount}
+          </span>
+          {onEditStage && (
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onEditStage(stage);
+              }}
+              title="Editar etapa"
+              aria-label={`Editar etapa ${stage.name}`}
+              className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+            >
+              <svg
+                className="h-4 w-4"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
+                <path d="M10 6a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex-1 space-y-2 overflow-y-auto p-2">

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { ManagedSelect } from "@/components/ui/managed-select";
 import { Textarea } from "@/components/ui/textarea";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { Lead, LeadSource, Specialty, User } from "@/lib/types/database";
@@ -240,12 +241,54 @@ export function LeadForm({
         </div>
 
         <div className="grid gap-4 sm:grid-cols-3">
-          <Select
+          <ManagedSelect<LeadSource>
             label="Fonte"
             placeholder="Selecione a fonte"
             value={sourceId}
-            onChange={(e) => setSourceId(e.target.value)}
-            options={sources.map((s) => ({ value: s.id, label: s.name }))}
+            onChange={setSourceId}
+            items={sources}
+            createLabel="Criar nova fonte"
+            emptyLabel="Nenhuma fonte cadastrada"
+            onCreate={async ({ name }) => {
+              if (!companyId) throw new Error("Empresa não identificada.");
+              const supabase = createClient();
+              const { data, error: insertError } = await supabase
+                .from("lead_sources")
+                .insert({ name, company_id: companyId })
+                .select("*")
+                .single();
+              if (insertError || !data) {
+                throw new Error(insertError?.message || "Erro ao criar fonte.");
+              }
+              const created = data as unknown as LeadSource;
+              setSources((prev) =>
+                [...prev, created].sort((a, b) =>
+                  a.name.localeCompare(b.name)
+                )
+              );
+              return created;
+            }}
+            onUpdate={async (id, { name }) => {
+              const supabase = createClient();
+              const { data, error: updateError } = await supabase
+                .from("lead_sources")
+                .update({ name })
+                .eq("id", id)
+                .select("*")
+                .single();
+              if (updateError || !data) {
+                throw new Error(
+                  updateError?.message || "Erro ao atualizar fonte."
+                );
+              }
+              const updated = data as unknown as LeadSource;
+              setSources((prev) =>
+                prev
+                  .map((s) => (s.id === id ? updated : s))
+                  .sort((a, b) => a.name.localeCompare(b.name))
+              );
+              return updated;
+            }}
           />
           <Select
             label="Responsável"
@@ -257,12 +300,61 @@ export function LeadForm({
               label: u.is_dentist ? `Dr(a). ${u.name}` : u.name,
             }))}
           />
-          <Select
+          <ManagedSelect<Specialty>
             label="Especialidade"
             placeholder="Selecione"
             value={specialtyId}
-            onChange={(e) => setSpecialtyId(e.target.value)}
-            options={specialties.map((s) => ({ value: s.id, label: s.name }))}
+            onChange={setSpecialtyId}
+            items={specialties}
+            withColor
+            createLabel="Criar nova especialidade"
+            emptyLabel="Nenhuma especialidade cadastrada"
+            onCreate={async ({ name, color }) => {
+              if (!companyId) throw new Error("Empresa não identificada.");
+              const supabase = createClient();
+              const { data, error: insertError } = await supabase
+                .from("specialties")
+                .insert({
+                  name,
+                  color: color || "#3b82f6",
+                  company_id: companyId,
+                })
+                .select("*")
+                .single();
+              if (insertError || !data) {
+                throw new Error(
+                  insertError?.message || "Erro ao criar especialidade."
+                );
+              }
+              const created = data as unknown as Specialty;
+              setSpecialties((prev) =>
+                [...prev, created].sort((a, b) =>
+                  a.name.localeCompare(b.name)
+                )
+              );
+              return created;
+            }}
+            onUpdate={async (id, { name, color }) => {
+              const supabase = createClient();
+              const { data, error: updateError } = await supabase
+                .from("specialties")
+                .update({ name, ...(color ? { color } : {}) })
+                .eq("id", id)
+                .select("*")
+                .single();
+              if (updateError || !data) {
+                throw new Error(
+                  updateError?.message || "Erro ao atualizar especialidade."
+                );
+              }
+              const updated = data as unknown as Specialty;
+              setSpecialties((prev) =>
+                prev
+                  .map((s) => (s.id === id ? updated : s))
+                  .sort((a, b) => a.name.localeCompare(b.name))
+              );
+              return updated;
+            }}
           />
         </div>
       </div>

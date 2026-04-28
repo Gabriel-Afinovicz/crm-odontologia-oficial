@@ -6,7 +6,6 @@ import type {
   CustomFieldValue,
   Lead,
   LeadDetailed,
-  LeadFunnel,
   PipelineStage,
   Specialty,
   Tag,
@@ -16,22 +15,15 @@ import type {
 export const getDashboardData = cache(async (companyId: string) => {
   const supabase = await createClient();
 
-  const [funnelRes, recentLeadsRes] = await Promise.all([
-    supabase
-      .from("vw_lead_funnel")
-      .select("*")
-      .eq("company_id", companyId),
-    supabase
-      .from("leads")
-      .select("*")
-      .eq("company_id", companyId)
-      .order("created_at", { ascending: false })
-      .limit(10),
-  ]);
+  const { data: recentLeads } = await supabase
+    .from("leads")
+    .select("*")
+    .eq("company_id", companyId)
+    .order("created_at", { ascending: false })
+    .limit(10);
 
   return {
-    funnel: (funnelRes.data as unknown as LeadFunnel[]) ?? [],
-    recentLeads: (recentLeadsRes.data as unknown as Lead[]) ?? [],
+    recentLeads: (recentLeads as unknown as Lead[]) ?? [],
   };
 });
 

@@ -1,13 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { UserInfo } from "@/components/dashboard/user-info";
-import { LeadFunnel } from "@/components/dashboard/lead-funnel";
+import {
+  LeadFunnel,
+  type StageFunnelRow,
+} from "@/components/dashboard/lead-funnel";
 import { RecentLeads } from "@/components/dashboard/recent-leads";
 import { LeadKanbanBoard } from "@/components/dashboard/lead-kanban-board";
 import type {
   Lead,
-  LeadFunnel as LeadFunnelType,
   PipelineStage,
   Specialty,
 } from "@/lib/types/database";
@@ -21,7 +23,6 @@ type DashboardTab = "funil" | "kanban";
 interface DashboardContentProps {
   domain: string;
   companyName: string;
-  initialFunnel: LeadFunnelType[];
   initialRecentLeads: Lead[];
   initialKanbanLeads: KanbanLead[];
   initialOperators: KanbanOperator[];
@@ -30,10 +31,63 @@ interface DashboardContentProps {
   initialLastActivity: Record<string, string>;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Deriva o funil a partir das etapas atuais do pipeline (uma linha por
+ * coluna do kanban). O nome e a cor de cada cartão refletem exatamente a
+ * etapa correspondente — adicionar/renomear/recolorir uma coluna propaga
+ * automaticamente para o funil.
+ */
+function computeStageFunnel(
+  leads: KanbanLead[],
+  stages: PipelineStage[]
+): StageFunnelRow[] {
+  const now = Date.now();
+  const cutoff7 = now - 7 * DAY_MS;
+  const cutoff30 = now - 30 * DAY_MS;
+
+  const counts = new Map<
+    string,
+    { total: number; last_7_days: number; last_30_days: number }
+  >();
+  for (const stage of stages) {
+    counts.set(stage.id, { total: 0, last_7_days: 0, last_30_days: 0 });
+  }
+
+  for (const lead of leads) {
+    const bucket = counts.get(lead.stage_id);
+    if (!bucket) continue;
+    bucket.total += 1;
+    const createdAt = lead.created_at
+      ? new Date(lead.created_at).getTime()
+      : NaN;
+    if (!Number.isNaN(createdAt)) {
+      if (createdAt >= cutoff7) bucket.last_7_days += 1;
+      if (createdAt >= cutoff30) bucket.last_30_days += 1;
+    }
+  }
+
+  return stages.map((stage) => {
+    const bucket = counts.get(stage.id) ?? {
+      total: 0,
+      last_7_days: 0,
+      last_30_days: 0,
+    };
+    return {
+      stageId: stage.id,
+      label: stage.name,
+      color: stage.color,
+      total: bucket.total,
+      last_7_days: bucket.last_7_days,
+      last_30_days: bucket.last_30_days,
+    };
+  });
+}
+
 export function DashboardContent({
   domain,
   companyName,
-  initialFunnel,
   initialRecentLeads,
   initialKanbanLeads,
   initialOperators,
@@ -42,6 +96,14 @@ export function DashboardContent({
   initialLastActivity,
 }: DashboardContentProps) {
   const [tab, setTab] = useState<DashboardTab>("kanban");
+  const [leads, setLeads] = useState<KanbanLead[]>(initialKanbanLeads);
+  const [orderedStages, setOrderedStages] =
+    useState<PipelineStage[]>(initialStages);
+
+  const funnelData = useMemo(
+    () => computeStageFunnel(leads, orderedStages),
+    [leads, orderedStages]
+  );
 
   return (
     <div className="min-h-screen">
@@ -110,8 +172,12 @@ export function DashboardContent({
         </div>
 
         <div className={tab === "funil" ? "space-y-6" : "hidden"}>
-          <LeadFunnel initialData={initialFunnel} />
-          <RecentLeads domain={domain} initialLeads={initialRecentLeads} />
+          <LeadFunnel data={funnelData} />
+          <RecentLeads
+            domain={domain}
+            initialLeads={initialRecentLeads}
+            stages={orderedStages}
+          />
         </div>
         <div className={tab === "kanban" ? undefined : "hidden"}>
           <LeadKanbanBoard
@@ -121,6 +187,8 @@ export function DashboardContent({
             stages={initialStages}
             specialties={initialSpecialties}
             lastActivityByLead={initialLastActivity}
+            onLeadsChange={setLeads}
+            onStagesChange={setOrderedStages}
           />
         </div>
       </main>
