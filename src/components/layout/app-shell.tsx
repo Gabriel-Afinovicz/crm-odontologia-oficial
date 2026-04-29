@@ -12,8 +12,9 @@ interface AppShellProps {
 export function AppShell({ domain, showSettings, children }: AppShellProps) {
   const pathname = usePathname();
   const isLoginPage = pathname === `/${domain}`;
+  const isPublicPage = pathname?.startsWith(`/${domain}/confirmar/`);
 
-  if (isLoginPage) {
+  if (isLoginPage || isPublicPage) {
     return <>{children}</>;
   }
 

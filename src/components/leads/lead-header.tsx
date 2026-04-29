@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import type { ProcedureType, Room, User } from "@/lib/types/database";
-import { BookAppointmentModal } from "@/components/agenda/book-appointment-modal";
+import { AppointmentModal } from "@/components/agenda/appointment-modal";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 
 interface LeadHeaderProps {
@@ -30,8 +30,8 @@ export function LeadHeader({ leadId, leadName, domain }: LeadHeaderProps) {
   }>({ rooms: [], procedures: [], dentists: [] });
 
   useEffect(() => {
-    if (!companyId || !showBook) return;
-    if (agendaResources.rooms.length > 0) return;
+    if (!companyId) return;
+    let cancelled = false;
     const supabase = createClient();
     (async () => {
       const [r, p, u] = await Promise.all([
@@ -53,8 +53,10 @@ export function LeadHeader({ leadId, leadName, domain }: LeadHeaderProps) {
           .eq("company_id", companyId)
           .eq("is_active", true)
           .eq("is_dentist", true)
+          .neq("role", "super_admin")
           .order("name"),
       ]);
+      if (cancelled) return;
       setAgendaResources({
         rooms: (r.data as unknown as Room[]) ?? [],
         procedures: (p.data as unknown as ProcedureType[]) ?? [],
@@ -63,7 +65,10 @@ export function LeadHeader({ leadId, leadName, domain }: LeadHeaderProps) {
           [],
       });
     })();
-  }, [companyId, showBook, agendaResources.rooms.length]);
+    return () => {
+      cancelled = true;
+    };
+  }, [companyId]);
 
   return (
     <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -102,14 +107,14 @@ export function LeadHeader({ leadId, leadName, domain }: LeadHeaderProps) {
       </div>
 
       {showBook && (
-        <BookAppointmentModal
-          domain={domain}
+        <AppointmentModal
+          mode="create"
           rooms={agendaResources.rooms}
           procedures={agendaResources.procedures}
           dentists={agendaResources.dentists}
-          initialLeadId={leadId}
+          prefill={{ leadId }}
           onClose={() => setShowBook(false)}
-          onCreated={() => {
+          onSaved={() => {
             setShowBook(false);
             router.refresh();
           }}

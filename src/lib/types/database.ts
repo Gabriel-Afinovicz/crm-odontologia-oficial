@@ -1,3 +1,35 @@
+// ── Analytics ─────────────────────────────────────────────────────────────────
+
+export interface DashboardAnalytics {
+  new_leads: number;
+  prev_new_leads: number;
+  appointments_count: number;
+  prev_appointments_count: number;
+  today_appointments: number;
+  confirmed_appointments: number;
+  no_shows: number;
+  prev_no_shows: number;
+  active_leads: number;
+  won_leads: number;
+  lost_in_period: number;
+  inactive_leads_30d: number;
+  leads_without_appointment: number;
+  confirmation_rate: number;
+  no_show_rate: number;
+}
+
+export interface StageFunnelRow {
+  stage_id: string;
+  stage_name: string;
+  stage_color: string;
+  stage_position: number;
+  is_won: boolean;
+  is_lost: boolean;
+  total_leads: number;
+  new_in_period: number;
+  avg_days_in_stage: number;
+}
+
 // ── Enums ────────────────────────────────────────────────────────────────────
 
 export type UserRole = "admin" | "operator" | "super_admin";
@@ -111,6 +143,8 @@ export interface ProcedureType {
   created_at: string;
 }
 
+export type AgendaVisibility = "assigned_dentist" | "role_tag" | "clinic_wide";
+
 export interface Appointment {
   id: string;
   company_id: string;
@@ -122,16 +156,111 @@ export interface Appointment {
   ends_at: string;
   status: AppointmentStatus;
   notes: string | null;
+  visibility: AgendaVisibility;
+  visibility_tag_id: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface AppointmentDetailed extends Appointment {
   lead_name: string | null;
+  lead_phone: string | null;
   dentist_name: string | null;
   room_name: string | null;
   room_color: string | null;
   procedure_name: string | null;
+  procedure_duration_minutes: number | null;
+}
+
+export interface ClinicHours {
+  id: string;
+  company_id: string;
+  weekday: number;
+  is_open: boolean;
+  opens_at: string;
+  closes_at: string;
+  lunch_start: string | null;
+  lunch_end: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ClinicHoliday {
+  id: string;
+  company_id: string;
+  date: string;
+  name: string;
+  created_at: string;
+}
+
+export interface AgendaBlock {
+  id: string;
+  company_id: string;
+  dentist_id: string | null;
+  room_id: string | null;
+  starts_at: string;
+  ends_at: string;
+  reason: string | null;
+  created_at: string;
+}
+
+export type AvailabilityReason =
+  | "closed"
+  | "lunch"
+  | "holiday"
+  | "block"
+  | "appointment";
+
+export interface DentistAvailabilityInterval {
+  starts_at: string;
+  ends_at: string;
+  kind: "appointment" | "block";
+  label: string;
+}
+
+export interface DentistAvailabilityRow {
+  dentist_id: string;
+  dentist_name: string;
+  is_open: boolean;
+  opens_at: string | null;
+  closes_at: string | null;
+  busy_minutes: number;
+  free_minutes: number;
+  busy_intervals: DentistAvailabilityInterval[];
+}
+
+export type MessageTemplateKind =
+  | "confirmation"
+  | "reminder"
+  | "post_visit"
+  | "birthday"
+  | "custom";
+
+export interface MessageTemplate {
+  id: string;
+  company_id: string;
+  kind: MessageTemplateKind;
+  name: string;
+  body: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export type AppointmentConfirmationStatus =
+  | "pending"
+  | "confirmed"
+  | "reschedule_requested"
+  | "expired";
+
+export interface AppointmentConfirmation {
+  id: string;
+  appointment_id: string;
+  company_id: string;
+  token: string;
+  status: AppointmentConfirmationStatus;
+  created_at: string;
+  responded_at: string | null;
 }
 
 export interface Lead {
@@ -215,6 +344,91 @@ export interface Tag {
 export interface LeadTag {
   lead_id: string;
   tag_id: string;
+}
+
+export interface UserRoleTag {
+  id: string;
+  company_id: string;
+  name: string;
+  color: string;
+  marks_as_dentist: boolean;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface UserRoleTagAssignment {
+  user_id: string;
+  tag_id: string;
+}
+
+export type WhatsAppInstanceStatus =
+  | "disconnected"
+  | "connecting"
+  | "connected";
+
+export interface WhatsAppInstance {
+  id: string;
+  company_id: string;
+  instance_name: string;
+  status: WhatsAppInstanceStatus;
+  phone_number: string | null;
+  evolution_token: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WhatsAppChat {
+  id: string;
+  company_id: string;
+  instance_id: string;
+  remote_jid: string;
+  name: string | null;
+  lead_id: string | null;
+  last_message_at: string | null;
+  last_message_preview: string | null;
+  unread_count: number;
+  is_archived: boolean;
+  profile_picture_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type WhatsAppMessageDirection = "in" | "out";
+export type WhatsAppMessageMediaType =
+  | "text"
+  | "image"
+  | "audio"
+  | "document"
+  | "sticker"
+  | "video"
+  | "location"
+  | "contact"
+  | "unknown";
+export type WhatsAppMessageStatus =
+  | "pending"
+  | "sent"
+  | "delivered"
+  | "read"
+  | "failed";
+
+export interface WhatsAppMessage {
+  id: string;
+  company_id: string;
+  chat_id: string;
+  evolution_message_id: string | null;
+  direction: WhatsAppMessageDirection;
+  from_me: boolean;
+  body: string | null;
+  media_type: WhatsAppMessageMediaType;
+  media_url: string | null;
+  media_mime_type: string | null;
+  status: WhatsAppMessageStatus;
+  error_message: string | null;
+  sent_at: string | null;
+  received_at: string | null;
+  sender_user_id: string | null;
+  created_at: string;
 }
 
 // ── Views ────────────────────────────────────────────────────────────────────
@@ -320,6 +534,34 @@ export interface Database {
           Partial<Pick<Appointment, "status" | "notes">>;
         Update: Partial<Omit<Appointment, "id" | "created_at" | "updated_at">>;
       };
+      clinic_hours: {
+        Row: ClinicHours;
+        Insert: Omit<ClinicHours, "id" | "created_at" | "updated_at"> &
+          Partial<Pick<ClinicHours, "is_open" | "lunch_start" | "lunch_end">>;
+        Update: Partial<Omit<ClinicHours, "id" | "created_at" | "updated_at">>;
+      };
+      clinic_holidays: {
+        Row: ClinicHoliday;
+        Insert: Omit<ClinicHoliday, "id" | "created_at">;
+        Update: Partial<Omit<ClinicHoliday, "id" | "created_at">>;
+      };
+      agenda_blocks: {
+        Row: AgendaBlock;
+        Insert: Omit<AgendaBlock, "id" | "created_at">;
+        Update: Partial<Omit<AgendaBlock, "id" | "created_at">>;
+      };
+      message_templates: {
+        Row: MessageTemplate;
+        Insert: Omit<MessageTemplate, "id" | "created_at" | "updated_at" | "is_active"> &
+          Partial<Pick<MessageTemplate, "is_active">>;
+        Update: Partial<Omit<MessageTemplate, "id" | "created_at" | "updated_at">>;
+      };
+      appointment_confirmations: {
+        Row: AppointmentConfirmation;
+        Insert: Omit<AppointmentConfirmation, "id" | "created_at" | "responded_at" | "status"> &
+          Partial<Pick<AppointmentConfirmation, "status" | "responded_at">>;
+        Update: Partial<Omit<AppointmentConfirmation, "id" | "created_at">>;
+      };
       lead_sources: {
         Row: LeadSource;
         Insert: Omit<LeadSource, "id" | "created_at" | "is_active"> &
@@ -353,6 +595,96 @@ export interface Database {
         Row: LeadTag;
         Insert: LeadTag;
         Update: Partial<LeadTag>;
+      };
+      user_role_tags: {
+        Row: UserRoleTag;
+        Insert: Omit<UserRoleTag, "id" | "created_at" | "is_active" | "color" | "marks_as_dentist"> &
+          Partial<Pick<UserRoleTag, "is_active" | "color" | "marks_as_dentist">>;
+        Update: Partial<Omit<UserRoleTag, "id" | "created_at">>;
+      };
+      user_role_tag_assignments: {
+        Row: UserRoleTagAssignment;
+        Insert: UserRoleTagAssignment;
+        Update: Partial<UserRoleTagAssignment>;
+      };
+      whatsapp_instances: {
+        Row: WhatsAppInstance;
+        Insert: Omit<
+          WhatsAppInstance,
+          "id" | "created_at" | "updated_at" | "status" | "phone_number" | "evolution_token" | "connected_at"
+        > &
+          Partial<
+            Pick<
+              WhatsAppInstance,
+              "status" | "phone_number" | "evolution_token" | "connected_at"
+            >
+          >;
+        Update: Partial<Omit<WhatsAppInstance, "id" | "created_at">>;
+      };
+      whatsapp_chats: {
+        Row: WhatsAppChat;
+        Insert: Omit<
+          WhatsAppChat,
+          | "id"
+          | "created_at"
+          | "updated_at"
+          | "unread_count"
+          | "is_archived"
+          | "name"
+          | "last_message_at"
+          | "last_message_preview"
+          | "lead_id"
+          | "profile_picture_url"
+        > &
+          Partial<
+            Pick<
+              WhatsAppChat,
+              | "unread_count"
+              | "is_archived"
+              | "name"
+              | "last_message_at"
+              | "last_message_preview"
+              | "lead_id"
+              | "profile_picture_url"
+            >
+          >;
+        Update: Partial<Omit<WhatsAppChat, "id" | "created_at">>;
+      };
+      whatsapp_messages: {
+        Row: WhatsAppMessage;
+        Insert: Omit<
+          WhatsAppMessage,
+          | "id"
+          | "created_at"
+          | "from_me"
+          | "media_type"
+          | "status"
+          | "evolution_message_id"
+          | "body"
+          | "media_url"
+          | "media_mime_type"
+          | "error_message"
+          | "sent_at"
+          | "received_at"
+          | "sender_user_id"
+        > &
+          Partial<
+            Pick<
+              WhatsAppMessage,
+              | "from_me"
+              | "media_type"
+              | "status"
+              | "evolution_message_id"
+              | "body"
+              | "media_url"
+              | "media_mime_type"
+              | "error_message"
+              | "sent_at"
+              | "received_at"
+              | "sender_user_id"
+            >
+          >;
+        Update: Partial<Omit<WhatsAppMessage, "id" | "created_at">>;
       };
       user_pipeline_stage_order: {
         Row: {
@@ -418,6 +750,10 @@ export interface Database {
         Args: { p_company_id: string };
         Returns: void;
       };
+      find_lead_by_phone: {
+        Args: { p_company_id: string; p_phone: string };
+        Returns: string | null;
+      };
       apply_kanban_move: {
         Args: {
           p_lead_id: string;
@@ -438,6 +774,24 @@ export interface Database {
         };
         Returns: boolean;
       };
+      check_appointment_availability: {
+        Args: {
+          p_company_id: string;
+          p_dentist_id: string | null;
+          p_room_id: string | null;
+          p_starts_at: string;
+          p_ends_at: string;
+          p_exclude_id?: string | null;
+        };
+        Returns: AvailabilityReason | null;
+      };
+      get_dentist_availability: {
+        Args: {
+          p_company_id: string;
+          p_date: string;
+        };
+        Returns: DentistAvailabilityRow[];
+      };
       apply_kanban_move_v2: {
         Args: {
           p_lead_id: string;
@@ -455,6 +809,38 @@ export interface Database {
           p_ordered_ids: string[];
         };
         Returns: void;
+      };
+      confirmation_lookup: {
+        Args: { p_domain: string; p_token: string };
+        Returns: {
+          appointment_id: string;
+          status: AppointmentConfirmationStatus;
+          starts_at: string;
+          ends_at: string;
+          patient_name: string;
+          dentist_name: string | null;
+          clinic_name: string;
+        }[];
+      };
+      confirmation_respond: {
+        Args: { p_domain: string; p_token: string; p_action: string };
+        Returns: string;
+      };
+      get_dashboard_analytics: {
+        Args: {
+          p_company_id: string;
+          p_start: string;
+          p_end: string;
+        };
+        Returns: DashboardAnalytics;
+      };
+      get_stage_funnel: {
+        Args: {
+          p_company_id: string;
+          p_start: string;
+          p_end: string;
+        };
+        Returns: StageFunnelRow[];
       };
     };
     Enums: {

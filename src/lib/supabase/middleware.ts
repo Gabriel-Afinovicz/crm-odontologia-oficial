@@ -95,7 +95,8 @@ export async function updateSession(request: NextRequest) {
   }
 
   const isLoginPage = segments.length === 1;
-  const isProtectedRoute = segments.length > 1;
+  const isPublicConfirmation = segments[1] === "confirmar";
+  const isProtectedRoute = segments.length > 1 && !isPublicConfirmation;
 
   // /wosnicz/* → login se não autenticado; cross-tenant é validado no layout.
   if (domain === "wosnicz") {

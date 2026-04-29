@@ -43,25 +43,6 @@ export function LeadCustomFields({
   const canManageFields =
     profile?.role === "admin" || profile?.role === "super_admin";
 
-  /**
-   * Considera vazio quando o campo obrigatório não recebeu valor utilizável.
-   * `boolean` obrigatório significa "deve estar marcado" (i.e. o usuário
-   * confirmou positivamente o aceite).
-   */
-  function isEmptyValue(field: CustomField, raw: string | undefined): boolean {
-    const value = (raw ?? "").trim();
-    switch (field.field_type) {
-      case "select":
-        return value === "";
-      case "multi_select":
-        return value.split(",").filter(Boolean).length === 0;
-      case "boolean":
-        return value !== "true";
-      default:
-        return value === "";
-    }
-  }
-
   async function fetchFields() {
     if (!companyId) return;
     const supabase = createClient();
@@ -143,7 +124,7 @@ export function LeadCustomFields({
     if (!companyId) return;
 
     const missing = fields
-      .filter((f) => f.is_required && isEmptyValue(f, values[f.id]))
+      .filter((f) => f.is_required && isCustomFieldEmpty(f, values[f.id]))
       .map((f) => f.id);
     if (missing.length > 0) {
       setMissingFields(missing);
@@ -258,7 +239,7 @@ export function LeadCustomFields({
           <div className="space-y-3">
             {fields.map((field) => (
               <div key={field.id} className="group relative">
-                <FieldRenderer
+                <CustomFieldRenderer
                   field={field}
                   value={values[field.id] || ""}
                   onChange={(val) => handleChange(field.id, val)}
@@ -306,7 +287,29 @@ export function LeadCustomFields({
   );
 }
 
-function FieldRenderer({
+/**
+ * Considera vazio quando o campo obrigatório não recebeu valor utilizável.
+ * `boolean` obrigatório significa "deve estar marcado" (i.e. o usuário
+ * confirmou positivamente o aceite).
+ */
+export function isCustomFieldEmpty(
+  field: CustomField,
+  raw: string | undefined
+): boolean {
+  const value = (raw ?? "").trim();
+  switch (field.field_type) {
+    case "select":
+      return value === "";
+    case "multi_select":
+      return value.split(",").filter(Boolean).length === 0;
+    case "boolean":
+      return value !== "true";
+    default:
+      return value === "";
+  }
+}
+
+export function CustomFieldRenderer({
   field,
   value,
   onChange,

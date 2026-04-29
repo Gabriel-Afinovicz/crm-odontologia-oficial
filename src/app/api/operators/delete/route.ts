@@ -68,9 +68,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  if (targetRecord.role !== "operator") {
+  if (targetRecord.role !== "operator" && targetRecord.role !== "admin") {
     return NextResponse.json(
-      { error: "Apenas operadores podem ser excluídos por aqui." },
+      { error: "Apenas operadores ou administradores podem ser excluídos por aqui." },
       { status: 400 }
     );
   }

@@ -8,9 +8,12 @@ import {
 } from "@/components/dashboard/lead-funnel";
 import { RecentLeads } from "@/components/dashboard/recent-leads";
 import { LeadKanbanBoard } from "@/components/dashboard/lead-kanban-board";
+import { DashboardAnalyticsPanel } from "@/components/dashboard/dashboard-analytics";
 import type {
+  DashboardAnalytics,
   Lead,
   PipelineStage,
+  StageFunnelRow as AnalyticsFunnelRow,
   Specialty,
 } from "@/lib/types/database";
 import type {
@@ -18,7 +21,7 @@ import type {
   KanbanOperator,
 } from "@/lib/supabase/dashboard-data";
 
-type DashboardTab = "funil" | "kanban";
+type DashboardTab = "funil" | "kanban" | "analitico";
 
 interface DashboardContentProps {
   domain: string;
@@ -29,6 +32,8 @@ interface DashboardContentProps {
   initialStages: PipelineStage[];
   initialSpecialties: Specialty[];
   initialLastActivity: Record<string, string>;
+  initialAnalyticsKpis: DashboardAnalytics | null;
+  initialAnalyticsFunnel: AnalyticsFunnelRow[];
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -94,6 +99,8 @@ export function DashboardContent({
   initialStages,
   initialSpecialties,
   initialLastActivity,
+  initialAnalyticsKpis,
+  initialAnalyticsFunnel,
 }: DashboardContentProps) {
   const [tab, setTab] = useState<DashboardTab>("kanban");
   const [leads, setLeads] = useState<KanbanLead[]>(initialKanbanLeads);
@@ -128,46 +135,37 @@ export function DashboardContent({
 
         <div className="mb-4 inline-flex rounded-lg border border-gray-200 bg-white p-1 shadow-sm">
           <TabButton
+            active={tab === "kanban"}
+            onClick={() => setTab("kanban")}
+            icon={
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6a2.25 2.25 0 0 1 2.25-2.25h1.5A2.25 2.25 0 0 1 9.75 6v12a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18V6ZM14.25 6A2.25 2.25 0 0 1 16.5 3.75H18A2.25 2.25 0 0 1 20.25 6v6A2.25 2.25 0 0 1 18 14.25h-1.5A2.25 2.25 0 0 1 14.25 12V6Z" />
+              </svg>
+            }
+          >
+            Kanban
+          </TabButton>
+          <TabButton
             active={tab === "funil"}
             onClick={() => setTab("funil")}
             icon={
-              <svg
-                className="h-4 w-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.8}
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M3.75 5.25h16.5L14.25 12v6.75L9.75 21v-9L3.75 5.25Z"
-                />
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 5.25h16.5L14.25 12v6.75L9.75 21v-9L3.75 5.25Z" />
               </svg>
             }
           >
             Funil
           </TabButton>
           <TabButton
-            active={tab === "kanban"}
-            onClick={() => setTab("kanban")}
+            active={tab === "analitico"}
+            onClick={() => setTab("analitico")}
             icon={
-              <svg
-                className="h-4 w-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.8}
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M3.75 6a2.25 2.25 0 0 1 2.25-2.25h1.5A2.25 2.25 0 0 1 9.75 6v12a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18V6ZM14.25 6A2.25 2.25 0 0 1 16.5 3.75H18A2.25 2.25 0 0 1 20.25 6v6A2.25 2.25 0 0 1 18 14.25h-1.5A2.25 2.25 0 0 1 14.25 12V6Z"
-                />
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 0 1 3 19.875v-6.75ZM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V8.625ZM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V4.125Z" />
               </svg>
             }
           >
-            Kanban
+            Analítico
           </TabButton>
         </div>
 
@@ -191,6 +189,18 @@ export function DashboardContent({
             onStagesChange={setOrderedStages}
           />
         </div>
+        {tab === "analitico" && initialAnalyticsKpis && (
+          <DashboardAnalyticsPanel
+            initialKpis={initialAnalyticsKpis}
+            initialFunnel={initialAnalyticsFunnel}
+            initialPeriod="30d"
+          />
+        )}
+        {tab === "analitico" && !initialAnalyticsKpis && (
+          <div className="flex h-48 items-center justify-center rounded-xl border border-gray-200 bg-white text-sm text-gray-400">
+            Dados analíticos não disponíveis.
+          </div>
+        )}
       </main>
     </div>
   );

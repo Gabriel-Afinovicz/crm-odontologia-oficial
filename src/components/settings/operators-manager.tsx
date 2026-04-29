@@ -7,7 +7,11 @@ import { useCurrentCompany } from "@/hooks/use-current-company";
 import { useAuth } from "@/hooks/use-auth";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import type { User } from "@/lib/types/database";
+import type { User, UserRoleTag } from "@/lib/types/database";
+
+interface UserWithTags extends User {
+  tagIds: string[];
+}
 
 export function OperatorsManager() {
   const params = useParams<{ domain?: string }>();
@@ -15,48 +19,78 @@ export function OperatorsManager() {
   const { companyId, loading: companyLoading } = useCurrentCompany();
   const { profile } = useAuth();
 
-  const [operators, setOperators] = useState<User[]>([]);
+  const [users, setUsers] = useState<UserWithTags[]>([]);
+  const [tags, setTags] = useState<UserRoleTag[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [name, setName] = useState("");
   const [extension, setExtension] = useState("");
   const [password, setPassword] = useState("");
+  const [role, setRole] = useState<"operator" | "admin">("operator");
+  const [createTagIds, setCreateTagIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [savingTagsForId, setSavingTagsForId] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
 
-  async function fetchOperators() {
+  async function fetchAll() {
     if (!companyId) return;
     const supabase = createClient();
-    const { data, error } = await supabase
-      .from("users")
-      .select("*")
-      .eq("company_id", companyId)
-      .eq("role", "operator")
-      .order("name");
+    const [usersRes, tagsRes, assignmentsRes] = await Promise.all([
+      supabase
+        .from("users")
+        .select("*")
+        .eq("company_id", companyId)
+        .in("role", ["operator", "admin"])
+        .order("name"),
+      supabase
+        .from("user_role_tags")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("is_active", true)
+        .order("name"),
+      supabase
+        .from("user_role_tag_assignments")
+        .select("user_id, tag_id"),
+    ]);
 
-    if (error) {
-      setListError(error.message);
+    if (usersRes.error) {
+      setListError(usersRes.error.message);
       setLoading(false);
       return;
     }
 
+    const tagsByUser = new Map<string, string[]>();
+    for (const a of (assignmentsRes.data as
+      | { user_id: string; tag_id: string }[]
+      | null) ?? []) {
+      const arr = tagsByUser.get(a.user_id) ?? [];
+      arr.push(a.tag_id);
+      tagsByUser.set(a.user_id, arr);
+    }
+
     setListError(null);
-    setOperators((data ?? []) as unknown as User[]);
+    setUsers(
+      ((usersRes.data ?? []) as unknown as User[]).map((u) => ({
+        ...u,
+        tagIds: tagsByUser.get(u.id) ?? [],
+      }))
+    );
+    setTags((tagsRes.data as unknown as UserRoleTag[]) ?? []);
     setLoading(false);
   }
 
   useEffect(() => {
     if (companyLoading) return;
     if (!companyId) {
-      setOperators([]);
+      setUsers([]);
+      setTags([]);
       setLoading(false);
       return;
     }
-    fetchOperators();
+    fetchAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [companyLoading, companyId]);
 
@@ -90,12 +124,14 @@ export function OperatorsManager() {
         name: name.trim(),
         extension: extension.trim(),
         password,
+        role,
+        tagIds: createTagIds,
       }),
     });
 
     if (!res.ok) {
       const payload = (await res.json().catch(() => ({}))) as { error?: string };
-      setCreateError(payload.error ?? "Erro ao criar operador.");
+      setCreateError(payload.error ?? "Erro ao criar usuário.");
       setSaving(false);
       return;
     }
@@ -103,26 +139,41 @@ export function OperatorsManager() {
     setName("");
     setExtension("");
     setPassword("");
+    setRole("operator");
+    setCreateTagIds([]);
     setSaving(false);
-    await fetchOperators();
+    await fetchAll();
   }
 
-  async function toggleIsDentist(op: User) {
+  async function toggleTag(user: UserWithTags, tagId: string) {
     if (!companyId) return;
-    setTogglingId(op.id);
+    const has = user.tagIds.includes(tagId);
+    setSavingTagsForId(user.id);
     const supabase = createClient();
-    const { error } = await supabase
-      .from("users")
-      .update({ is_dentist: !op.is_dentist })
-      .eq("id", op.id);
-    setTogglingId(null);
+    const { error } = has
+      ? await supabase
+          .from("user_role_tag_assignments")
+          .delete()
+          .eq("user_id", user.id)
+          .eq("tag_id", tagId)
+      : await supabase
+          .from("user_role_tag_assignments")
+          .insert({ user_id: user.id, tag_id: tagId });
+    setSavingTagsForId(null);
     if (error) {
       setListError(error.message);
       return;
     }
-    setOperators((prev) =>
+    setUsers((prev) =>
       prev.map((u) =>
-        u.id === op.id ? { ...u, is_dentist: !op.is_dentist } : u
+        u.id === user.id
+          ? {
+              ...u,
+              tagIds: has
+                ? u.tagIds.filter((t) => t !== tagId)
+                : [...u.tagIds, tagId],
+            }
+          : u
       )
     );
   }
@@ -130,7 +181,7 @@ export function OperatorsManager() {
   async function handleDelete(userId: string, displayName: string) {
     if (!domain) return;
     const confirmed = window.confirm(
-      `Excluir o operador "${displayName}"? Esta ação não pode ser desfeita.`
+      `Excluir o usuário "${displayName}"? Esta ação não pode ser desfeita.`
     );
     if (!confirmed) return;
 
@@ -143,13 +194,13 @@ export function OperatorsManager() {
 
     if (!res.ok) {
       const payload = (await res.json().catch(() => ({}))) as { error?: string };
-      setListError(payload.error ?? "Erro ao excluir operador.");
+      setListError(payload.error ?? "Erro ao excluir usuário.");
       setDeletingId(null);
       return;
     }
 
     setDeletingId(null);
-    await fetchOperators();
+    await fetchAll();
   }
 
   const canRender = !companyLoading && companyId;
@@ -157,7 +208,7 @@ export function OperatorsManager() {
   return (
     <div className="space-y-6">
       <section className="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
-        <h2 className="text-sm font-semibold text-gray-900">Novo operador</h2>
+        <h2 className="text-sm font-semibold text-gray-900">Novo membro</h2>
         <p className="mt-0.5 text-xs text-gray-500">
           O login é feito com o ramal e a senha definidos aqui.
         </p>
@@ -176,7 +227,7 @@ export function OperatorsManager() {
             onChange={(e) => setName(e.target.value)}
           />
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-3">
             <Input
               label="Ramal *"
               placeholder="Ex: 1002"
@@ -191,11 +242,67 @@ export function OperatorsManager() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-700">
+                Permissão *
+              </label>
+              <select
+                value={role}
+                onChange={(e) => setRole(e.target.value as "operator" | "admin")}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+              >
+                <option value="operator">Operador</option>
+                <option value="admin">Administrador</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-gray-700">
+              Funções
+            </label>
+            {tags.length === 0 ? (
+              <p className="text-xs text-gray-500">
+                Nenhuma função cadastrada. Crie em &quot;Funções&quot;.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {tags.map((t) => {
+                  const active = createTagIds.includes(t.id);
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() =>
+                        setCreateTagIds((prev) =>
+                          prev.includes(t.id)
+                            ? prev.filter((x) => x !== t.id)
+                            : [...prev, t.id]
+                        )
+                      }
+                      className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
+                        active
+                          ? "border-transparent text-white"
+                          : "border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+                      }`}
+                      style={
+                        active
+                          ? { backgroundColor: t.color, borderColor: t.color }
+                          : undefined
+                      }
+                    >
+                      {t.name}
+                      {t.marks_as_dentist && " · dentista"}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           <div className="flex justify-end">
             <Button type="submit" loading={saving}>
-              Criar operador
+              Criar
             </Button>
           </div>
         </form>
@@ -204,10 +311,11 @@ export function OperatorsManager() {
       <section>
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-gray-900">
-            Operadores cadastrados
+            Membros da equipe
           </h2>
           <span className="text-xs text-gray-400">
-            {operators.length} {operators.length === 1 ? "operador" : "operadores"}
+            {users.length}{" "}
+            {users.length === 1 ? "membro" : "membros"}
           </span>
         </div>
 
@@ -221,9 +329,9 @@ export function OperatorsManager() {
           <div className="rounded-xl border border-dashed border-gray-300 bg-white p-8 text-center text-sm text-gray-500">
             Carregando…
           </div>
-        ) : operators.length === 0 ? (
+        ) : users.length === 0 ? (
           <div className="rounded-xl border border-dashed border-gray-300 bg-white p-8 text-center text-sm text-gray-500">
-            Nenhum operador cadastrado ainda.
+            Nenhum membro cadastrado ainda.
           </div>
         ) : (
           <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
@@ -237,7 +345,10 @@ export function OperatorsManager() {
                     Ramal
                   </th>
                   <th className="px-5 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                    Dentista
+                    Permissão
+                  </th>
+                  <th className="px-5 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                    Funções
                   </th>
                   <th className="px-5 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
                     Status
@@ -248,43 +359,69 @@ export function OperatorsManager() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {operators.map((op) => {
-                  const isSelf = profile?.id === op.id;
-                  const isDeleting = deletingId === op.id;
+                {users.map((u) => {
+                  const isSelf = profile?.id === u.id;
+                  const isDeleting = deletingId === u.id;
                   return (
-                    <tr key={op.id}>
+                    <tr key={u.id}>
                       <td className="px-5 py-3">
                         <p className="text-sm font-medium text-gray-900">
-                          {op.name}
+                          {u.name}
                         </p>
-                        <p className="text-xs text-gray-400">{op.email}</p>
+                        <p className="text-xs text-gray-400">{u.email}</p>
                       </td>
                       <td className="px-5 py-3">
                         <code className="rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-700">
-                          {op.extension_number}
+                          {u.extension_number}
                         </code>
                       </td>
                       <td className="px-5 py-3">
-                        <button
-                          type="button"
-                          onClick={() => toggleIsDentist(op)}
-                          disabled={togglingId === op.id}
-                          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-50 ${
-                            op.is_dentist
-                              ? "bg-emerald-100 text-emerald-700 hover:bg-emerald-200"
-                              : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                            u.role === "admin"
+                              ? "bg-blue-100 text-blue-700"
+                              : "bg-gray-100 text-gray-700"
                           }`}
                         >
-                          <span
-                            className={`h-1.5 w-1.5 rounded-full ${
-                              op.is_dentist ? "bg-emerald-500" : "bg-gray-400"
-                            }`}
-                          />
-                          {op.is_dentist ? "Sim" : "Não"}
-                        </button>
+                          {u.role === "admin" ? "Admin" : "Operador"}
+                        </span>
                       </td>
                       <td className="px-5 py-3">
-                        {op.is_active ? (
+                        <div className="flex flex-wrap gap-1">
+                          {tags.length === 0 ? (
+                            <span className="text-xs text-gray-400">—</span>
+                          ) : (
+                            tags.map((t) => {
+                              const active = u.tagIds.includes(t.id);
+                              return (
+                                <button
+                                  key={t.id}
+                                  type="button"
+                                  disabled={savingTagsForId === u.id}
+                                  onClick={() => toggleTag(u, t.id)}
+                                  className={`rounded-full border px-2 py-0.5 text-[11px] font-medium transition ${
+                                    active
+                                      ? "border-transparent text-white"
+                                      : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+                                  }`}
+                                  style={
+                                    active
+                                      ? {
+                                          backgroundColor: t.color,
+                                          borderColor: t.color,
+                                        }
+                                      : undefined
+                                  }
+                                >
+                                  {t.name}
+                                </button>
+                              );
+                            })
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-5 py-3">
+                        {u.is_active ? (
                           <span className="text-xs text-green-700">Ativo</span>
                         ) : (
                           <span className="text-xs text-gray-400">Inativo</span>
@@ -296,7 +433,7 @@ export function OperatorsManager() {
                           size="sm"
                           disabled={isSelf}
                           loading={isDeleting}
-                          onClick={() => handleDelete(op.id, op.name)}
+                          onClick={() => handleDelete(u.id, u.name)}
                         >
                           Excluir
                         </Button>

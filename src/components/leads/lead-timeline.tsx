@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useCurrentCompany } from "@/hooks/use-current-company";
 import type { ActivityDetailed, ActivityType } from "@/lib/types/database";
@@ -28,27 +28,60 @@ export function LeadTimeline({ leadId, initialActivities }: LeadTimelineProps) {
   );
   const [loading, setLoading] = useState(initialActivities === undefined);
 
-  useEffect(() => {
-    if (initialActivities !== undefined) return;
+  const fetchActivities = useCallback(async () => {
     if (!companyId) return;
+    const supabase = createClient();
+    const { data, error } = await supabase
+      .from("vw_activities_detailed")
+      .select("*")
+      .eq("company_id", companyId)
+      .eq("lead_id", leadId)
+      .order("created_at", { ascending: false });
 
-    async function fetchActivities() {
-      const supabase = createClient();
-      const { data, error } = await supabase
-        .from("vw_activities_detailed")
-        .select("*")
-        .eq("company_id", companyId!)
-        .eq("lead_id", leadId)
-        .order("created_at", { ascending: false });
-
-      if (!error && data) {
-        setActivities(data as unknown as ActivityDetailed[]);
-      }
-      setLoading(false);
+    if (!error && data) {
+      setActivities(data as unknown as ActivityDetailed[]);
     }
+    setLoading(false);
+  }, [companyId, leadId]);
 
-    fetchActivities();
-  }, [leadId, companyId, initialActivities]);
+  useEffect(() => {
+    if (initialActivities === undefined) {
+      if (companyId) fetchActivities();
+      return;
+    }
+    // Quando a página recarrega via router.refresh(), os novos `initialActivities`
+    // chegam por props. Sincronizamos para manter o componente em dia mesmo se
+    // o realtime estiver indisponível.
+    setActivities(initialActivities);
+    setLoading(false);
+  }, [companyId, initialActivities, fetchActivities]);
+
+  // Realtime: re-busca a timeline sempre que uma atividade desse lead for
+  // criada/alterada/removida — cobre tanto o "Adicionar" manual quanto as
+  // atividades automáticas (status_change, assignment, agendamento, etc.).
+  useEffect(() => {
+    if (!companyId) return;
+    const supabase = createClient();
+    const channel = supabase
+      .channel(`lead-activities:${leadId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "activities",
+          filter: `lead_id=eq.${leadId}`,
+        },
+        () => {
+          fetchActivities();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [companyId, leadId, fetchActivities]);
 
   if (loading) {
     return (

@@ -4,10 +4,12 @@ import type {
   ActivityDetailed,
   CustomField,
   CustomFieldValue,
+  DashboardAnalytics,
   Lead,
   LeadDetailed,
   PipelineStage,
   Specialty,
+  StageFunnelRow,
   Tag,
   User,
 } from "@/lib/types/database";
@@ -26,6 +28,82 @@ export const getDashboardData = cache(async (companyId: string) => {
     recentLeads: (recentLeads as unknown as Lead[]) ?? [],
   };
 });
+
+export type AnalyticsPeriod = "today" | "7d" | "30d" | "month";
+
+function periodToDates(period: AnalyticsPeriod): { start: Date; end: Date } {
+  const now = new Date();
+  const end = new Date(now);
+  end.setMilliseconds(999);
+
+  switch (period) {
+    case "today": {
+      const start = new Date(now);
+      start.setHours(0, 0, 0, 0);
+      return { start, end };
+    }
+    case "7d": {
+      const start = new Date(now);
+      start.setDate(start.getDate() - 7);
+      start.setHours(0, 0, 0, 0);
+      return { start, end };
+    }
+    case "30d": {
+      const start = new Date(now);
+      start.setDate(start.getDate() - 30);
+      start.setHours(0, 0, 0, 0);
+      return { start, end };
+    }
+    case "month": {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      return { start, end };
+    }
+  }
+}
+
+export async function getAnalyticsDashboard(
+  companyId: string,
+  period: AnalyticsPeriod = "30d"
+): Promise<{ kpis: DashboardAnalytics; funnel: StageFunnelRow[] }> {
+  const supabase = await createClient();
+  const { start, end } = periodToDates(period);
+
+  const [kpisRes, funnelRes] = await Promise.all([
+    supabase.rpc("get_dashboard_analytics", {
+      p_company_id: companyId,
+      p_start: start.toISOString(),
+      p_end: end.toISOString(),
+    }),
+    supabase.rpc("get_stage_funnel", {
+      p_company_id: companyId,
+      p_start: start.toISOString(),
+      p_end: end.toISOString(),
+    }),
+  ]);
+
+  const empty: DashboardAnalytics = {
+    new_leads: 0,
+    prev_new_leads: 0,
+    appointments_count: 0,
+    prev_appointments_count: 0,
+    today_appointments: 0,
+    confirmed_appointments: 0,
+    no_shows: 0,
+    prev_no_shows: 0,
+    active_leads: 0,
+    won_leads: 0,
+    lost_in_period: 0,
+    inactive_leads_30d: 0,
+    leads_without_appointment: 0,
+    confirmation_rate: 0,
+    no_show_rate: 0,
+  };
+
+  return {
+    kpis: (kpisRes.data as unknown as DashboardAnalytics) ?? empty,
+    funnel: (funnelRes.data as unknown as StageFunnelRow[]) ?? [],
+  };
+}
 
 export const getLeadActivities = cache(
   async (companyId: string, leadId: string): Promise<ActivityDetailed[]> => {
@@ -94,6 +172,7 @@ export const getKanbanData = cache(async (companyId: string) => {
       .select("id, name, is_dentist")
       .eq("company_id", companyId)
       .eq("is_active", true)
+      .neq("role", "super_admin")
       .order("name"),
     supabase
       .from("pipeline_stages")

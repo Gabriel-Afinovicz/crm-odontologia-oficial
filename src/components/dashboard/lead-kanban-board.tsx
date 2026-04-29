@@ -610,7 +610,7 @@ export function LeadKanbanBoard({
                   : "text-gray-600 hover:bg-gray-50"
               }`}
             >
-              {mode === "none" ? "Sem raias" : "Raias por Dentista/Operador"}
+              {mode === "none" ? "Sem raias" : "Raias por Dentista"}
             </button>
           ))}
         </div>

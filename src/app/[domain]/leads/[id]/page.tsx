@@ -61,9 +61,9 @@ export default async function LeadDetailPage({ params }: LeadDetailPageProps) {
         domain={domain}
       />
 
-      <div className="mt-6 grid gap-6 lg:grid-cols-3">
+      <div className="mt-6 grid gap-6 lg:grid-cols-5">
         {/* Left column: info + tags */}
-        <div className="space-y-6 lg:col-span-1">
+        <div className="space-y-6 lg:col-span-3">
           <LeadInfo lead={typedLead} />
           <LeadTags
             leadId={typedLead.id}

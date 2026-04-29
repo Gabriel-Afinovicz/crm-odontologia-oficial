@@ -1,6 +1,10 @@
 import { redirect } from "next/navigation";
 import { getAuthSession, getDomainCompany } from "@/lib/supabase/cached-data";
-import { getDashboardData, getKanbanData } from "@/lib/supabase/dashboard-data";
+import {
+  getDashboardData,
+  getKanbanData,
+  getAnalyticsDashboard,
+} from "@/lib/supabase/dashboard-data";
 import { DashboardContent } from "./dashboard-content";
 
 interface DashboardPageProps {
@@ -20,8 +24,12 @@ export default async function DashboardPage({ params }: DashboardPageProps) {
 
   const companyName = company?.name ?? domain;
 
-  const [{ recentLeads }, kanban] = company
-    ? await Promise.all([getDashboardData(company.id), getKanbanData(company.id)])
+  const [{ recentLeads }, kanban, analytics] = company
+    ? await Promise.all([
+        getDashboardData(company.id),
+        getKanbanData(company.id),
+        getAnalyticsDashboard(company.id, "30d"),
+      ])
     : [
         { recentLeads: [] },
         {
@@ -31,6 +39,7 @@ export default async function DashboardPage({ params }: DashboardPageProps) {
           specialties: [],
           lastActivityByLead: {},
         },
+        { kpis: null, funnel: [] },
       ];
 
   return (
@@ -43,6 +52,8 @@ export default async function DashboardPage({ params }: DashboardPageProps) {
       initialStages={kanban.stages}
       initialSpecialties={kanban.specialties}
       initialLastActivity={kanban.lastActivityByLead}
+      initialAnalyticsKpis={analytics.kpis}
+      initialAnalyticsFunnel={analytics.funnel}
     />
   );
 }

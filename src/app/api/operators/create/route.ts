@@ -7,6 +7,8 @@ interface CreateOperatorPayload {
   name?: string;
   extension?: string;
   password?: string;
+  role?: "operator" | "admin";
+  tagIds?: string[];
 }
 
 const EXTENSION_REGEX = /^[0-9]+$/;
@@ -23,6 +25,11 @@ export async function POST(req: NextRequest) {
   const name = body.name?.trim();
   const extension = body.extension?.trim();
   const password = body.password;
+  const role: "operator" | "admin" =
+    body.role === "admin" ? "admin" : "operator";
+  const tagIds = Array.isArray(body.tagIds)
+    ? body.tagIds.filter((t): t is string => typeof t === "string")
+    : [];
 
   if (!domain) {
     return NextResponse.json({ error: "Domínio obrigatório." }, { status: 400 });
@@ -84,15 +91,33 @@ export async function POST(req: NextRequest) {
       p_email: email,
       p_extension_number: extension,
       p_password: password,
-      p_role: "operator",
+      p_role: role,
     }
   );
 
   if (rpcError) {
     return NextResponse.json(
-      { error: `Erro ao criar operador: ${rpcError.message}` },
+      { error: `Erro ao criar usuário: ${rpcError.message}` },
       { status: 500 }
     );
+  }
+
+  if (typeof newUserId === "string" && tagIds.length > 0) {
+    const { error: tagErr } = await supabaseAdmin
+      .from("user_role_tag_assignments")
+      .insert(tagIds.map((tagId) => ({ user_id: newUserId, tag_id: tagId })));
+    if (tagErr) {
+      return NextResponse.json(
+        {
+          id: newUserId,
+          name,
+          extension,
+          email,
+          warning: `Usuário criado, mas houve erro ao salvar funções: ${tagErr.message}`,
+        },
+        { status: 200 }
+      );
+    }
   }
 
   return NextResponse.json({ id: newUserId, name, extension, email });
