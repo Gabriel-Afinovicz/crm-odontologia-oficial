@@ -10,6 +10,12 @@ interface SendPayload {
   chatId?: string;
   phone?: string;
   leadId?: string;
+  /**
+   * Solicita explicitamente preview de link na Evolution. Quando ausente,
+   * habilitamos automaticamente caso o texto contenha uma URL https — assim
+   * lembretes/confirmacoes que carregam links viram tocaveis no WhatsApp.
+   */
+  linkPreview?: boolean;
 }
 
 interface InstanceRow {
@@ -192,68 +198,91 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Insere mensagem em pending para feedback rapido na UI via realtime
-  const { data: pending, error: insertErr } = await supabaseAdmin
-    .from("whatsapp_messages")
-    .insert({
-      company_id: companyId,
-      chat_id: chatRow.id,
-      direction: "out",
-      from_me: true,
-      body: text,
-      status: "pending",
-      sender_user_id: profileRow.id,
-    })
-    .select("id")
-    .single();
-  if (insertErr || !pending) {
-    return NextResponse.json(
-      { error: `Erro ao registrar mensagem: ${insertErr?.message}` },
-      { status: 500 }
-    );
-  }
-  const pendingId = (pending as { id: string }).id;
-
+  // Envia via Evolution PRIMEIRO para obter evolution_message_id, e so depois
+  // insere no banco (ja com o id). Isso elimina o race condition em que o
+  // webhook chegava antes da update e inseria uma duplicata.
+  let evoMessageId: string | null = null;
+  // Decide linkPreview: respeita explicito; senao, ativa quando texto contem
+  // URL https (lembretes/confirmacoes). Outros fluxos sem link nao pagam custo.
+  const wantsLinkPreview =
+    typeof body.linkPreview === "boolean"
+      ? body.linkPreview
+      : /https:\/\/\S+/i.test(text);
   try {
     const sendRes = await evolution.sendText(
       instanceRow.instance_name,
       targetJid,
-      text
+      text,
+      { linkPreview: wantsLinkPreview }
     );
-
-    await supabaseAdmin
-      .from("whatsapp_messages")
-      .update({
-        evolution_message_id: sendRes.key?.id ?? null,
-        status: "sent",
-        sent_at: new Date().toISOString(),
-      })
-      .eq("id", pendingId);
-
-    await supabaseAdmin
-      .from("whatsapp_chats")
-      .update({
-        last_message_at: new Date().toISOString(),
-        last_message_preview: text.slice(0, 120),
-      })
-      .eq("id", chatRow.id);
-
-    return NextResponse.json({
-      ok: true,
-      chatId: chatRow.id,
-      messageId: pendingId,
-      remoteJid: targetJid,
-      phone: targetPhone,
-    });
+    evoMessageId = sendRes.key?.id ?? null;
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro desconhecido";
-    await supabaseAdmin
-      .from("whatsapp_messages")
-      .update({ status: "failed", error_message: message })
-      .eq("id", pendingId);
     return NextResponse.json(
       { error: `Falha ao enviar via Evolution: ${message}` },
       { status: 502 }
     );
   }
+
+  const sentAt = new Date().toISOString();
+
+  // Idempotencia: pode ser que o webhook tenha sido mais rapido e ja inseriu
+  // a mensagem com este evolution_message_id. Se for o caso, apenas pega o id.
+  let messageId: string | null = null;
+  if (evoMessageId) {
+    const { data: existing } = await supabaseAdmin
+      .from("whatsapp_messages")
+      .select("id")
+      .eq("company_id", companyId)
+      .eq("evolution_message_id", evoMessageId)
+      .maybeSingle();
+    messageId = (existing as { id: string } | null)?.id ?? null;
+  }
+
+  if (!messageId) {
+    const { data: inserted, error: insertErr } = await supabaseAdmin
+      .from("whatsapp_messages")
+      .insert({
+        company_id: companyId,
+        chat_id: chatRow.id,
+        evolution_message_id: evoMessageId,
+        direction: "out",
+        from_me: true,
+        body: text,
+        status: "sent",
+        sent_at: sentAt,
+        sender_user_id: profileRow.id,
+      })
+      .select("id")
+      .single();
+    if (insertErr || !inserted) {
+      return NextResponse.json(
+        { error: `Erro ao registrar mensagem: ${insertErr?.message}` },
+        { status: 500 }
+      );
+    }
+    messageId = (inserted as { id: string }).id;
+  } else {
+    // Webhook ja inseriu; complementa com sender_user_id que ele nao tem.
+    await supabaseAdmin
+      .from("whatsapp_messages")
+      .update({ sender_user_id: profileRow.id })
+      .eq("id", messageId);
+  }
+
+  await supabaseAdmin
+    .from("whatsapp_chats")
+    .update({
+      last_message_at: sentAt,
+      last_message_preview: text.slice(0, 120),
+    })
+    .eq("id", chatRow.id);
+
+  return NextResponse.json({
+    ok: true,
+    chatId: chatRow.id,
+    messageId,
+    remoteJid: targetJid,
+    phone: targetPhone,
+  });
 }

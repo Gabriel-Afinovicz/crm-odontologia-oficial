@@ -38,6 +38,15 @@ function clearSupabaseAuthCookies(
  * Isso elimina uma query adicional por navegação no edge.
  */
 export async function updateSession(request: NextRequest) {
+  // Rotas de API nunca devem passar pela logica de tenant/redirect — elas
+  // sao chamadas por clientes (webhooks, fetch interno) sem cookies de sessao.
+  // Sem este early return, o middleware tratava "api" como nome de tenant
+  // e redirecionava webhooks publicos (ex: /api/whatsapp/webhook/...) para
+  // /api, fazendo a requisicao nunca chegar no route handler.
+  if (request.nextUrl.pathname.startsWith("/api/")) {
+    return NextResponse.next({ request });
+  }
+
   let supabaseResponse = NextResponse.next({ request });
 
   const supabase = createServerClient(

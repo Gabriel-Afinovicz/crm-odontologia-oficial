@@ -1,3 +1,4 @@
+import type { Metadata, Viewport } from "next";
 import { createClient } from "@/lib/supabase/server";
 import { ConfirmationView } from "./confirmation-view";
 
@@ -15,6 +16,18 @@ interface ConfirmationLookup {
   clinic_name: string;
 }
 
+export const metadata: Metadata = {
+  title: "Confirmação de consulta",
+  description: "Confirme sua consulta de forma rápida e segura.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 5,
+  themeColor: "#2563eb",
+};
+
 export default async function ConfirmationPage({
   params,
 }: ConfirmationPageProps) {
@@ -28,7 +41,7 @@ export default async function ConfirmationPage({
   const row = (data as ConfirmationLookup[] | null)?.[0] ?? null;
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-blue-50 via-white to-emerald-50 px-4 py-10">
+    <div className="flex min-h-[100dvh] flex-col items-center justify-start bg-gradient-to-br from-blue-50 via-white to-emerald-50 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(1.5rem,env(safe-area-inset-top))] sm:items-center sm:justify-center sm:py-10">
       <ConfirmationView domain={domain} token={token} initial={row} />
     </div>
   );

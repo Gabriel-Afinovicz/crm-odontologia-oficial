@@ -23,6 +23,87 @@ interface ConversasContentProps {
   instance: WhatsAppInstance;
   initialChats: WhatsAppChat[];
   initialChatId: string | null;
+  initialHasMore: boolean;
+  pageSize: number;
+}
+
+function compareChatsDesc(a: WhatsAppChat, b: WhatsAppChat): number {
+  // Mais recente primeiro; nulls vao para o final
+  const at = a.last_message_at;
+  const bt = b.last_message_at;
+  if (!at && !bt) return 0;
+  if (!at) return 1;
+  if (!bt) return -1;
+  return bt.localeCompare(at);
+}
+
+// Faz upsert idempotente de uma mensagem no array, deduplicando por id real e
+// por evolution_message_id, alem de substituir mensagens otimistas (temp-) que
+// correspondam por body/from_me.
+function upsertMessage(
+  prev: WhatsAppMessage[],
+  next: WhatsAppMessage
+): WhatsAppMessage[] {
+  // 1) Mesmo id: substitui in-place
+  const byId = prev.findIndex((m) => m.id === next.id);
+  if (byId !== -1) {
+    const copy = [...prev];
+    copy[byId] = next;
+    return copy;
+  }
+  // 2) Mesmo evolution_message_id (caso exista um registro com id antigo)
+  if (next.evolution_message_id) {
+    const byEvo = prev.findIndex(
+      (m) =>
+        !!m.evolution_message_id &&
+        m.evolution_message_id === next.evolution_message_id
+    );
+    if (byEvo !== -1) {
+      const copy = [...prev];
+      copy[byEvo] = next;
+      return copy;
+    }
+  }
+  // 3) Mensagem otimista: troca pelo registro real do banco
+  if (next.from_me) {
+    const byTemp = prev.findIndex(
+      (m) =>
+        m.id.startsWith("temp-") &&
+        m.from_me === next.from_me &&
+        m.body === next.body
+    );
+    if (byTemp !== -1) {
+      const copy = [...prev];
+      copy[byTemp] = next;
+      return copy;
+    }
+  }
+  return [...prev, next];
+}
+
+// Remove duplicatas por id, mantendo a ultima ocorrencia. Defesa final
+// contra qualquer caso em que duas mensagens com mesmo id entrem no array
+// (p.ex. dois subscribers ativos durante HMR/StrictMode em dev).
+function dedupeById(list: WhatsAppMessage[]): WhatsAppMessage[] {
+  const map = new Map<string, WhatsAppMessage>();
+  for (const m of list) {
+    map.set(m.id, m);
+  }
+  return Array.from(map.values());
+}
+
+// Jitter aleatorio aplicado entre envios em rajada para simular digitacao
+// humana e reduzir o risco do WhatsApp marcar o numero como bot. Mensagem
+// isolada (fila vazia no momento do clique) nao paga o custo deste delay.
+const JITTER_MIN_MS = 250;
+const JITTER_MAX_MS = 800;
+
+function randInt(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function jidToPhoneDisplay(jid: string) {
@@ -49,8 +130,12 @@ export function ConversasContent({
   instance,
   initialChats,
   initialChatId,
+  initialHasMore,
+  pageSize,
 }: ConversasContentProps) {
   const [chats, setChats] = useState<WhatsAppChat[]>(initialChats);
+  const [hasMore, setHasMore] = useState(initialHasMore);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [activeChatId, setActiveChatId] = useState<string | null>(
     initialChatId ?? initialChats[0]?.id ?? null
   );
@@ -64,8 +149,27 @@ export function ConversasContent({
   const [leadSearch, setLeadSearch] = useState("");
   const [leadOptions, setLeadOptions] = useState<Pick<Lead, "id" | "name" | "phone">[]>([]);
   const [linkedLeadName, setLinkedLeadName] = useState<string | null>(null);
+  const [showContactPanel, setShowContactPanel] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // Refs para acessar valores atuais dentro de callbacks de realtime
+  const hasMoreRef = useRef(hasMore);
+  const chatsRef = useRef(chats);
+  const activeChatIdRef = useRef(activeChatId);
+  // Fila de envio: cada nova mensagem aguarda a anterior terminar para
+  // garantir que cheguem ao WhatsApp na mesma ordem em que foram enviadas
+  // pelo usuario, mesmo se varias forem disparadas em rapida sucessao.
+  const sendQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const pendingSendsRef = useRef(0);
+  useEffect(() => {
+    hasMoreRef.current = hasMore;
+  }, [hasMore]);
+  useEffect(() => {
+    chatsRef.current = chats;
+  }, [chats]);
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
 
   const activeChat = useMemo(
     () => chats.find((c) => c.id === activeChatId) ?? null,
@@ -82,6 +186,11 @@ export function ConversasContent({
       return phone.includes(q) || name.includes(q) || preview.includes(q);
     });
   }, [chats, search]);
+
+  // Defesa final: sempre renderiza mensagens deduplicadas por id, evitando
+  // o warning "two children with the same key" e bubbles duplicados na UI
+  // mesmo se algum cenario raro acabar inserindo duplicatas no state.
+  const renderedMessages = useMemo(() => dedupeById(messages), [messages]);
 
   useEffect(() => {
     let cancelled = false;
@@ -102,7 +211,10 @@ export function ConversasContent({
         .order("created_at", { ascending: true })
         .limit(500);
       if (cancelled) return;
-      setMessages((data as WhatsAppMessage[] | null) ?? []);
+      const fresh = (data as WhatsAppMessage[] | null) ?? [];
+      // Garante dedup ja na carga inicial caso o banco ou o realtime gerem
+      // alguma duplicacao logica.
+      setMessages(dedupeById(fresh));
       setLoadingMessages(false);
     })();
     return () => {
@@ -134,40 +246,55 @@ export function ConversasContent({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
-  // Realtime: chats e messages da company
+  // Realtime: chats e messages da company.
+  // Importante: NAO usamos filter no servidor (postgres_changes filter)
+  // porque em algumas versoes do Realtime o filtro por UUID pode entregar
+  // INSERTs de forma inconsistente. Em vez disso, deixamos a RLS filtrar
+  // por company (ja faz isso) e aplicamos um filtro client-side adicional.
   useEffect(() => {
     const supabase = createClient();
+    // Nome de canal unico por mount evita que React StrictMode/HMR em dev
+    // mantenham dois subscribers ativos no mesmo nome de canal e entreguem
+    // o mesmo evento em duplicidade.
+    const channelName = `whatsapp-${companyId}-${Math.random().toString(36).slice(2, 9)}`;
     const channel = supabase
-      .channel(`whatsapp-${companyId}`)
+      .channel(channelName)
       .on(
         "postgres_changes",
         {
           event: "*",
           schema: "public",
           table: "whatsapp_chats",
-          filter: `company_id=eq.${companyId}`,
         },
         (payload) => {
           const next = payload.new as WhatsAppChat | null;
           const old = payload.old as WhatsAppChat | null;
           if (payload.eventType === "DELETE" && old) {
+            if (old.company_id !== companyId) return;
             setChats((prev) => prev.filter((c) => c.id !== old.id));
             return;
           }
           if (!next) return;
+          if (next.company_id !== companyId) return;
           setChats((prev) => {
             const idx = prev.findIndex((c) => c.id === next.id);
-            if (idx === -1) {
-              return [next, ...prev];
+            if (idx !== -1) {
+              const copy = [...prev];
+              copy[idx] = next;
+              copy.sort(compareChatsDesc);
+              return copy;
             }
-            const copy = [...prev];
-            copy[idx] = next;
-            copy.sort((a, b) => {
-              const ax = a.last_message_at ?? "";
-              const bx = b.last_message_at ?? "";
-              return bx.localeCompare(ax);
-            });
-            return copy;
+            const lastVisible = prev[prev.length - 1];
+            const lastTs = lastVisible?.last_message_at ?? null;
+            const nextTs = next.last_message_at ?? null;
+            const stillHasMore = hasMoreRef.current;
+            const fitsInPage =
+              !stillHasMore ||
+              (nextTs != null && (lastTs == null || nextTs > lastTs));
+            if (!fitsInPage) {
+              return prev;
+            }
+            return [...prev, next].sort(compareChatsDesc);
           });
         }
       )
@@ -177,27 +304,101 @@ export function ConversasContent({
           event: "*",
           schema: "public",
           table: "whatsapp_messages",
-          filter: `company_id=eq.${companyId}`,
         },
         (payload) => {
           const next = payload.new as WhatsAppMessage | null;
           if (!next) return;
-          setMessages((prev) => {
-            if (next.chat_id !== activeChatId) return prev;
-            const idx = prev.findIndex((m) => m.id === next.id);
-            if (idx === -1) return [...prev, next];
-            const copy = [...prev];
-            copy[idx] = next;
-            return copy;
-          });
+          if (next.company_id !== companyId) return;
+          // Usa ref para sempre ler o activeChatId atual; o canal nao re-subscreve
+          // ao trocar de conversa, evitando perder mensagens em transito.
+          if (next.chat_id !== activeChatIdRef.current) return;
+          setMessages((prev) => upsertMessage(prev, next));
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (process.env.NODE_ENV === "development") {
+          console.debug(`[realtime] channel ${channelName} status:`, status);
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [companyId, activeChatId]);
+  }, [companyId]);
+
+  // Polling de seguranca: a cada 10s busca mensagens recentes do chat ativo
+  // e da o chat list. Funciona como fallback caso o WebSocket de Realtime
+  // esteja temporariamente desconectado ou um evento se perca. Usa upsertMessage
+  // para nao gerar duplicacoes.
+  useEffect(() => {
+    const supabase = createClient();
+    let cancelled = false;
+
+    async function syncActiveChat() {
+      const chatId = activeChatIdRef.current;
+      if (!chatId) return;
+      const { data } = await supabase
+        .from("whatsapp_messages")
+        .select("*")
+        .eq("chat_id", chatId)
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (cancelled) return;
+      const recent = (data as WhatsAppMessage[] | null) ?? [];
+      if (recent.length === 0) return;
+      // Reordena para asc (mais antiga primeiro) e faz upsert sem duplicar
+      recent.reverse();
+      setMessages((prev) => {
+        let next = prev;
+        for (const m of recent) {
+          next = upsertMessage(next, m);
+        }
+        return dedupeById(next);
+      });
+    }
+
+    async function syncChatList() {
+      const { data } = await supabase
+        .from("whatsapp_chats")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("is_archived", false)
+        .order("last_message_at", { ascending: false, nullsFirst: false })
+        .limit(pageSize);
+      if (cancelled) return;
+      const list = (data as WhatsAppChat[] | null) ?? [];
+      if (list.length === 0) return;
+      setChats((prev) => {
+        const map = new Map<string, WhatsAppChat>();
+        for (const c of prev) map.set(c.id, c);
+        for (const c of list) map.set(c.id, c);
+        return Array.from(map.values()).sort(compareChatsDesc);
+      });
+    }
+
+    function tick() {
+      if (document.hidden) return;
+      void syncActiveChat();
+      void syncChatList();
+    }
+
+    const interval = setInterval(tick, 10000);
+
+    function onVisibility() {
+      if (!document.hidden) {
+        // Forca um sync imediato quando a aba volta ao foco
+        void syncActiveChat();
+        void syncChatList();
+      }
+    }
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [companyId, pageSize]);
 
   const leadIdForName = activeChat?.lead_id ?? null;
   useEffect(() => {
@@ -243,24 +444,108 @@ export function ConversasContent({
     return () => clearTimeout(t);
   }, [showLinkLead, leadSearch, companyId]);
 
-  async function handleSend(e?: FormEvent) {
+  function handleSend(e?: FormEvent) {
     e?.preventDefault();
     const text = draft.trim();
     if (!text || !activeChat) return;
-    setSending(true);
-    setSendError(null);
+    const chatIdAtSend = activeChat.id;
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const nowIso = new Date().toISOString();
+
+    // Mensagem otimista para feedback imediato na UI, sem depender do realtime
+    const optimistic: WhatsAppMessage = {
+      id: tempId,
+      company_id: companyId,
+      chat_id: chatIdAtSend,
+      evolution_message_id: null,
+      direction: "out",
+      from_me: true,
+      body: text,
+      media_type: "text",
+      media_url: null,
+      media_mime_type: null,
+      status: "pending",
+      error_message: null,
+      sent_at: null,
+      received_at: null,
+      sender_user_id: null,
+      created_at: nowIso,
+    };
+    setMessages((prev) => [...prev, optimistic]);
     setDraft("");
-    const res = await fetch("/api/whatsapp/messages/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chatId: activeChat.id, text }),
-    });
-    setSending(false);
-    if (!res.ok) {
-      const payload = (await res.json().catch(() => ({}))) as { error?: string };
-      setSendError(payload.error ?? "Falha ao enviar.");
-      setDraft(text);
-    }
+    setSendError(null);
+    // Captura se a fila estava vazia ANTES de incrementar o contador.
+    // Mensagem isolada nao paga o custo do jitter; rajada paga.
+    const wasQueueEmpty = pendingSendsRef.current === 0;
+    pendingSendsRef.current += 1;
+    setSending(true);
+
+    // Encadeia o envio na fila: a chamada HTTP so dispara apos a anterior
+    // terminar, garantindo a mesma ordem no WhatsApp do destinatario.
+    const previousQueue = sendQueueRef.current;
+    const thisSend = (async () => {
+      try {
+        await previousQueue;
+      } catch {
+        // Erros do envio anterior nao impedem o proximo de tentar
+      }
+      // Jitter aleatorio apenas quando ha rajada (alguem ja estava na fila).
+      // Simula intervalo de digitacao humana entre mensagens consecutivas.
+      if (!wasQueueEmpty) {
+        await sleep(randInt(JITTER_MIN_MS, JITTER_MAX_MS));
+      }
+      try {
+        const res = await fetch("/api/whatsapp/messages/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId: chatIdAtSend, text }),
+        });
+        if (!res.ok) {
+          const payload = (await res.json().catch(() => ({}))) as { error?: string };
+          setSendError(payload.error ?? "Falha ao enviar.");
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempId
+                ? { ...m, status: "failed", error_message: payload.error ?? "Falha" }
+                : m
+            )
+          );
+          return;
+        }
+        const payload = (await res.json().catch(() => ({}))) as {
+          messageId?: string;
+        };
+        if (payload.messageId) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempId
+                ? {
+                    ...m,
+                    id: payload.messageId!,
+                    status: "sent",
+                    sent_at: new Date().toISOString(),
+                  }
+                : m
+            )
+          );
+        }
+      } catch (err) {
+        setSendError(err instanceof Error ? err.message : "Falha ao enviar.");
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempId
+              ? { ...m, status: "failed", error_message: "Erro de rede" }
+              : m
+          )
+        );
+      } finally {
+        pendingSendsRef.current = Math.max(0, pendingSendsRef.current - 1);
+        if (pendingSendsRef.current === 0) {
+          setSending(false);
+        }
+      }
+    })();
+    sendQueueRef.current = thisSend;
   }
 
   function handleKey(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -288,6 +573,38 @@ export function ConversasContent({
       .from("whatsapp_chats")
       .update({ lead_id: null })
       .eq("id", activeChat.id);
+  }
+
+  async function loadMore() {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const supabase = createClient();
+      const offset = chatsRef.current.length;
+      // Pede pageSize + 1 para detectar se ainda ha mais paginas
+      const { data } = await supabase
+        .from("whatsapp_chats")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("is_archived", false)
+        .order("last_message_at", { ascending: false, nullsFirst: false })
+        .range(offset, offset + pageSize);
+      const fetched = (data as WhatsAppChat[] | null) ?? [];
+      const more = fetched.length > pageSize;
+      const page = more ? fetched.slice(0, pageSize) : fetched;
+      setChats((prev) => {
+        const existingIds = new Set(prev.map((c) => c.id));
+        const merged = [...prev];
+        for (const c of page) {
+          if (!existingIds.has(c.id)) merged.push(c);
+        }
+        merged.sort(compareChatsDesc);
+        return merged;
+      });
+      setHasMore(more);
+    } finally {
+      setLoadingMore(false);
+    }
   }
 
   return (
@@ -325,22 +642,21 @@ export function ConversasContent({
                   <button
                     key={c.id}
                     type="button"
-                    onClick={() => setActiveChatId(c.id)}
+                    onClick={() => {
+                      setActiveChatId(c.id);
+                      setShowContactPanel(false);
+                    }}
                     className={`flex w-full items-start gap-3 border-b border-gray-100 px-4 py-3 text-left transition-colors ${
                       active ? "bg-blue-50" : "hover:bg-gray-50"
                     }`}
                   >
-                    <div
-                      className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${
-                        c.lead_id
-                          ? "bg-emerald-100 text-emerald-700"
-                          : "bg-gray-200 text-gray-600"
-                      }`}
-                    >
-                      {(c.name ?? c.remote_jid.slice(0, 2))
-                        .replace(/\D/g, "")
-                        .slice(-2) || "??"}
-                    </div>
+                    <ContactAvatar
+                      pictureUrl={c.profile_picture_url}
+                      displayName={c.name}
+                      jid={c.remote_jid}
+                      hasLead={Boolean(c.lead_id)}
+                      size={40}
+                    />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
                         <p className="truncate text-sm font-medium text-gray-900">
@@ -374,6 +690,18 @@ export function ConversasContent({
                 );
               })
             )}
+            {hasMore && !search.trim() && (
+              <div className="border-t border-gray-100 p-3">
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  {loadingMore ? "Carregando..." : "Carregar mais"}
+                </button>
+              </div>
+            )}
           </div>
         </aside>
 
@@ -385,14 +713,28 @@ export function ConversasContent({
           ) : (
             <>
               <div className="flex items-center justify-between border-b border-gray-200 bg-white px-5 py-3">
-                <div>
-                  <p className="text-sm font-semibold text-gray-900">
-                    {activeChat.name || jidToPhoneDisplay(activeChat.remote_jid)}
-                  </p>
-                  <p className="text-xs text-gray-500">
-                    {jidToPhoneDisplay(activeChat.remote_jid)}
-                  </p>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowContactPanel(true)}
+                  className="flex items-center gap-3 rounded-lg p-1 text-left transition-colors hover:bg-gray-50"
+                  aria-label="Ver dados do contato"
+                >
+                  <ContactAvatar
+                    pictureUrl={activeChat.profile_picture_url}
+                    displayName={activeChat.name}
+                    jid={activeChat.remote_jid}
+                    hasLead={Boolean(activeChat.lead_id)}
+                    size={40}
+                  />
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900">
+                      {activeChat.name || jidToPhoneDisplay(activeChat.remote_jid)}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      {jidToPhoneDisplay(activeChat.remote_jid)}
+                    </p>
+                  </div>
+                </button>
                 <div className="flex items-center gap-2">
                   {activeChat.lead_id ? (
                     <>
@@ -428,13 +770,13 @@ export function ConversasContent({
                   <div className="text-center text-xs text-gray-400">
                     Carregando mensagens...
                   </div>
-                ) : messages.length === 0 ? (
+                ) : renderedMessages.length === 0 ? (
                   <div className="text-center text-xs text-gray-400">
                     Sem mensagens nesta conversa.
                   </div>
                 ) : (
                   <div className="flex flex-col gap-1.5">
-                    {messages.map((m) => (
+                    {renderedMessages.map((m) => (
                       <MessageBubble key={m.id} message={m} />
                     ))}
                   </div>
@@ -461,16 +803,35 @@ export function ConversasContent({
                 />
                 <button
                   type="submit"
-                  disabled={sending || !draft.trim()}
+                  disabled={!draft.trim()}
                   className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
+                  title={
+                    sending
+                      ? "Enviando mensagens anteriores em ordem..."
+                      : undefined
+                  }
                 >
-                  {sending ? "Enviando..." : "Enviar"}
+                  Enviar
                 </button>
               </form>
             </>
           )}
         </section>
       </div>
+
+      {showContactPanel && activeChat && (
+        <ContactPanel
+          chat={activeChat}
+          domain={domain}
+          linkedLeadName={linkedLeadName}
+          onClose={() => setShowContactPanel(false)}
+          onLinkLead={() => {
+            setShowContactPanel(false);
+            setShowLinkLead(true);
+          }}
+          onUnlinkLead={unlinkLead}
+        />
+      )}
 
       {showLinkLead && (
         <div
@@ -526,6 +887,224 @@ export function ConversasContent({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function getInitials(name: string | null, jid: string): string {
+  if (name && name.trim()) {
+    const parts = name.trim().split(/\s+/);
+    if (parts.length >= 2) {
+      return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+    }
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  const phone = jid.replace(/\D/g, "");
+  return phone.slice(-2) || "??";
+}
+
+interface ContactAvatarProps {
+  pictureUrl: string | null;
+  displayName: string | null;
+  jid: string;
+  hasLead: boolean;
+  size: number;
+}
+
+function ContactAvatar({
+  pictureUrl,
+  displayName,
+  jid,
+  hasLead,
+  size,
+}: ContactAvatarProps) {
+  const [errored, setErrored] = useState(false);
+  const initials = getInitials(displayName, jid);
+  const fallbackBg = hasLead
+    ? "bg-emerald-100 text-emerald-700"
+    : "bg-gray-200 text-gray-600";
+
+  if (pictureUrl && !errored) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={pictureUrl}
+        alt={displayName ?? "Contato"}
+        onError={() => setErrored(true)}
+        style={{ width: size, height: size }}
+        className="shrink-0 rounded-full object-cover"
+      />
+    );
+  }
+  return (
+    <div
+      style={{ width: size, height: size }}
+      className={`flex shrink-0 items-center justify-center rounded-full text-sm font-semibold ${fallbackBg}`}
+    >
+      {initials}
+    </div>
+  );
+}
+
+interface ContactPanelProps {
+  chat: WhatsAppChat;
+  domain: string;
+  linkedLeadName: string | null;
+  onClose: () => void;
+  onLinkLead: () => void;
+  onUnlinkLead: () => void;
+}
+
+function ContactPanel({
+  chat,
+  domain,
+  linkedLeadName,
+  onClose,
+  onLinkLead,
+  onUnlinkLead,
+}: ContactPanelProps) {
+  const phone = chat.remote_jid.replace(/@.*$/, "");
+  const phoneDisplay = jidToPhoneDisplay(chat.remote_jid);
+  const displayName = chat.name || phoneDisplay;
+  const waLink = `https://wa.me/${phone}`;
+
+  return (
+    <div
+      className="fixed inset-0 z-40 flex justify-end bg-black/30"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <aside
+        role="dialog"
+        aria-modal="true"
+        aria-label="Dados do contato"
+        className="flex h-full w-full max-w-sm flex-col bg-white shadow-xl"
+      >
+        <header className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg p-1.5 text-gray-500 hover:bg-gray-100"
+              aria-label="Fechar"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+            <h2 className="text-sm font-semibold text-gray-900">
+              Dados do contato
+            </h2>
+          </div>
+        </header>
+
+        <div className="flex flex-1 flex-col overflow-y-auto">
+          <div className="flex flex-col items-center gap-3 border-b border-gray-100 bg-gray-50 px-6 py-8">
+            <ContactAvatar
+              pictureUrl={chat.profile_picture_url}
+              displayName={chat.name}
+              jid={chat.remote_jid}
+              hasLead={Boolean(chat.lead_id)}
+              size={120}
+            />
+            <div className="text-center">
+              <p className="text-lg font-semibold text-gray-900">
+                {displayName}
+              </p>
+              <p className="mt-1 text-sm text-gray-500">{phoneDisplay}</p>
+            </div>
+            <a
+              href={waLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-white px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-50"
+            >
+              Abrir no WhatsApp
+            </a>
+          </div>
+
+          <section className="border-b border-gray-100 px-5 py-4">
+            <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              Vinculo com lead
+            </h3>
+            {chat.lead_id ? (
+              <div className="space-y-2">
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2">
+                  <p className="text-xs text-emerald-700">Lead vinculado</p>
+                  <p className="mt-0.5 text-sm font-medium text-emerald-900">
+                    {linkedLeadName ?? "—"}
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Link
+                    href={`/${domain}/leads/${chat.lead_id}`}
+                    className="flex-1 rounded-lg border border-gray-200 bg-white px-3 py-2 text-center text-xs font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    Ver lead
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={onUnlinkLead}
+                    className="rounded-lg border border-red-200 bg-white px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50"
+                  >
+                    Desvincular
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={onLinkLead}
+                className="w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700"
+              >
+                Vincular a um lead
+              </button>
+            )}
+          </section>
+
+          <section className="border-b border-gray-100 px-5 py-4">
+            <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              Informacoes
+            </h3>
+            <dl className="space-y-2 text-sm">
+              <div className="flex justify-between gap-2">
+                <dt className="text-gray-500">Telefone</dt>
+                <dd className="text-gray-900">{phoneDisplay}</dd>
+              </div>
+              <div className="flex justify-between gap-2">
+                <dt className="text-gray-500">Mensagens nao lidas</dt>
+                <dd className="text-gray-900">{chat.unread_count}</dd>
+              </div>
+              {chat.last_message_at && (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-gray-500">Ultima atividade</dt>
+                  <dd className="text-gray-900">
+                    {new Date(chat.last_message_at).toLocaleString("pt-BR")}
+                  </dd>
+                </div>
+              )}
+              <div className="flex justify-between gap-2">
+                <dt className="text-gray-500">Iniciada em</dt>
+                <dd className="text-gray-900">
+                  {new Date(chat.created_at).toLocaleDateString("pt-BR")}
+                </dd>
+              </div>
+            </dl>
+          </section>
+        </div>
+      </aside>
     </div>
   );
 }

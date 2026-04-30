@@ -124,14 +124,38 @@ type TabId =
   | "role-tags"
   | "whatsapp";
 
+const VALID_TABS: TabId[] = [
+  "pipeline",
+  "specialties",
+  "tags",
+  "sources",
+  "custom-fields",
+  "rooms",
+  "procedures",
+  "hours",
+  "holidays",
+  "blocks",
+  "templates",
+  "operators",
+  "role-tags",
+  "whatsapp",
+];
+
 interface SettingsContentProps {
   canManageOperators?: boolean;
+  initialTab?: string;
 }
 
 export function SettingsContent({
   canManageOperators = false,
+  initialTab,
 }: SettingsContentProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("pipeline");
+  const resolvedInitial =
+    initialTab && (VALID_TABS as string[]).includes(initialTab)
+      ? (initialTab as TabId)
+      : "pipeline";
+
+  const [activeTab, setActiveTab] = useState<TabId>(resolvedInitial);
 
   const groups = canManageOperators
     ? [

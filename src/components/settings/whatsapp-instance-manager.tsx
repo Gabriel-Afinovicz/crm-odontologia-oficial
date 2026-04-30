@@ -19,6 +19,11 @@ interface ConnectResponse {
 }
 
 const POLL_MS = 3000;
+// Cooldown apos sincronizacao bem sucedida. Evita que o usuario clique
+// repetidamente no botao e dispare uma rajada de chamadas para a Evolution
+// API (findChats + whatsappNumbers em batches), o que pode levar o numero
+// a ser flagado como comportamento automatizado.
+const SYNC_COOLDOWN_MS = 60_000;
 
 export function WhatsAppInstanceManager() {
   const params = useParams<{ domain?: string }>();
@@ -30,9 +35,67 @@ export function WhatsAppInstanceManager() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [showQrModal, setShowQrModal] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<string | null>(null);
+  const [cooldownRemaining, setCooldownRemaining] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const syncedRef = useRef(false);
+  const lastSyncAtRef = useRef<number>(0);
+  const cooldownTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function startCooldown() {
+    lastSyncAtRef.current = Date.now();
+    setCooldownRemaining(Math.ceil(SYNC_COOLDOWN_MS / 1000));
+    if (cooldownTickRef.current) {
+      clearInterval(cooldownTickRef.current);
+    }
+    cooldownTickRef.current = setInterval(() => {
+      const elapsed = Date.now() - lastSyncAtRef.current;
+      const remaining = Math.max(
+        0,
+        Math.ceil((SYNC_COOLDOWN_MS - elapsed) / 1000)
+      );
+      setCooldownRemaining(remaining);
+      if (remaining <= 0 && cooldownTickRef.current) {
+        clearInterval(cooldownTickRef.current);
+        cooldownTickRef.current = null;
+      }
+    }, 1000);
+  }
+
+  async function syncChats() {
+    if (!domain || syncing) return;
+    // Bloqueia se ainda esta no cooldown apos um sync recente
+    const sinceLast = Date.now() - lastSyncAtRef.current;
+    if (lastSyncAtRef.current > 0 && sinceLast < SYNC_COOLDOWN_MS) return;
+
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await fetch("/api/whatsapp/instance/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain }),
+      });
+      if (res.ok) {
+        const payload = (await res.json()) as { synced?: number; total?: number };
+        const synced = payload.synced ?? 0;
+        const total = payload.total ?? 0;
+        setSyncResult(
+          synced > 0
+            ? `${synced} conversa${synced !== 1 ? "s" : ""} importada${synced !== 1 ? "s" : ""} com sucesso.`
+            : total > 0
+              ? "Todas as conversas ja estao sincronizadas."
+              : "Nenhuma conversa encontrada na instancia."
+        );
+        startCooldown();
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   async function fetchStatus(): Promise<StatusResponse | null> {
     if (!domain) return null;
@@ -51,7 +114,19 @@ export function WhatsAppInstanceManager() {
       setLoading(false);
       return;
     }
-    setInstance(s.instance);
+    setInstance((prev) => {
+      // Detecta transição para connected: dispara sync automático uma vez
+      if (
+        s.instance?.status === "connected" &&
+        prev?.status !== "connected" &&
+        !syncedRef.current
+      ) {
+        syncedRef.current = true;
+        // Chama sync fora do setState para não bloquear a atualização de estado
+        setTimeout(() => syncChats(), 0);
+      }
+      return s.instance;
+    });
     if (s.qrBase64) setQr(s.qrBase64);
     if (s.pairingCode) setPairingCode(s.pairingCode);
     if (s.instance?.status === "connected" && pollRef.current) {
@@ -68,6 +143,7 @@ export function WhatsAppInstanceManager() {
     refresh();
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (cooldownTickRef.current) clearInterval(cooldownTickRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [domain]);
@@ -173,7 +249,24 @@ export function WhatsAppInstanceManager() {
                 </span>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={syncChats}
+                disabled={syncing || busy || cooldownRemaining > 0}
+                title={
+                  cooldownRemaining > 0
+                    ? `Aguarde ${cooldownRemaining}s antes de sincronizar novamente para evitar comportamento que possa flagar o numero.`
+                    : undefined
+                }
+                className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+              >
+                {syncing
+                  ? "Sincronizando..."
+                  : cooldownRemaining > 0
+                    ? `Aguarde ${cooldownRemaining}s para sincronizar novamente`
+                    : "Sincronizar conversas"}
+              </button>
               <button
                 type="button"
                 onClick={handleConnect}
@@ -191,6 +284,9 @@ export function WhatsAppInstanceManager() {
                 Desconectar
               </button>
             </div>
+            {syncResult && (
+              <p className="text-xs text-emerald-700">{syncResult}</p>
+            )}
           </div>
         ) : (
           <div className="mt-4 space-y-3">
@@ -248,19 +344,12 @@ export function WhatsAppInstanceManager() {
                   src={qr.startsWith("data:") ? qr : `data:image/png;base64,${qr}`}
                   alt="QR Code WhatsApp"
                   className="h-64 w-64 rounded-lg border border-gray-200"
+                  style={{ filter: "saturate(0) contrast(5)" }}
                 />
               ) : (
                 <div className="flex h-64 w-64 items-center justify-center rounded-lg border border-dashed border-gray-300 text-xs text-gray-400">
                   Aguardando QR...
                 </div>
-              )}
-              {pairingCode && (
-                <p className="text-xs text-gray-600">
-                  Codigo de pareamento:{" "}
-                  <code className="rounded bg-gray-100 px-2 py-0.5 font-mono">
-                    {pairingCode}
-                  </code>
-                </p>
               )}
               <p className="text-[11px] text-gray-400">
                 Esta janela atualiza sozinha quando a conexao for efetivada.

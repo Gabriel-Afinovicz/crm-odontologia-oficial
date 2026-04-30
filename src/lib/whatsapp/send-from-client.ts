@@ -15,6 +15,11 @@ export interface SendArgs {
   leadId?: string;
   /** Telefone manual (com ou sem mascara). */
   phone?: string;
+  /**
+   * Solicita preview de link na mensagem (Evolution faz scraping da URL).
+   * Util em lembretes/confirmacoes para que o link vire tocavel no app.
+   */
+  linkPreview?: boolean;
 }
 
 export type SendResult =
@@ -31,7 +36,7 @@ function openWaMeFallback(phone: string | null | undefined, text: string) {
 }
 
 export async function sendWhatsAppMessage(args: SendArgs): Promise<SendResult> {
-  const { text, chatId, leadId, phone } = args;
+  const { text, chatId, leadId, phone, linkPreview } = args;
   if (!text.trim()) {
     return { kind: "error", message: "Mensagem vazia." };
   }
@@ -41,7 +46,7 @@ export async function sendWhatsAppMessage(args: SendArgs): Promise<SendResult> {
     res = await fetch("/api/whatsapp/messages/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, chatId, leadId, phone }),
+      body: JSON.stringify({ text, chatId, leadId, phone, linkPreview }),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Erro de rede";

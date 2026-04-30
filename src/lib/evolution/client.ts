@@ -94,6 +94,36 @@ export interface SendMessageResponse {
   messageTimestamp?: number | string;
 }
 
+export interface EvolutionChatItem {
+  id?: string | null;
+  remoteJid: string;
+  pushName?: string | null;
+  name?: string | null;
+  profilePicUrl?: string | null;
+  updatedAt?: string | null;
+  unreadCount?: number | null;
+  lastMessage?: {
+    messageTimestamp?: number | string | null;
+    message?: Record<string, unknown> | null;
+  } | null;
+}
+
+export interface EvolutionInstanceItem {
+  id: string;
+  name: string;
+  connectionStatus?: string;
+  ownerJid?: string | null;
+  profileName?: string | null;
+  profilePicUrl?: string | null;
+}
+
+export interface EvolutionWhatsAppNumberInfo {
+  jid: string;
+  exists: boolean;
+  number: string;
+  name?: string | null;
+}
+
 function webhookUrlFor(instanceName: string): string | undefined {
   if (!WEBHOOK_BASE) return undefined;
   return `${WEBHOOK_BASE.replace(/\/$/, "")}/api/whatsapp/webhook/${encodeURIComponent(instanceName)}`;
@@ -109,6 +139,7 @@ export const evolution = {
     };
     if (webhook) {
       body.webhook = {
+        enabled: true,
         url: webhook,
         byEvents: false,
         base64: true,
@@ -160,18 +191,107 @@ export const evolution = {
   async sendText(
     instanceName: string,
     jid: string,
-    text: string
+    text: string,
+    options?: { linkPreview?: boolean }
   ): Promise<SendMessageResponse> {
+    const body: Record<string, unknown> = { number: jid, text };
+    // Quando habilitado, a Evolution faz scraping do link e envia como
+    // mensagem com preview, o que ajuda o WhatsApp a tratar a URL como
+    // tocavel no celular do destinatario.
+    if (options?.linkPreview) {
+      body.linkPreview = true;
+    }
     return request<SendMessageResponse>(
       `/message/sendText/${encodeURIComponent(instanceName)}`,
       {
         method: "POST",
-        body: JSON.stringify({
-          number: jid,
-          text,
-        }),
+        body: JSON.stringify(body),
       }
     );
+  },
+
+  async findChats(instanceName: string): Promise<EvolutionChatItem[]> {
+    const result = await request<
+      EvolutionChatItem[] | { data?: EvolutionChatItem[]; chats?: EvolutionChatItem[] }
+    >(`/chat/findChats/${encodeURIComponent(instanceName)}`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    if (Array.isArray(result)) return result;
+    return result?.data ?? result?.chats ?? [];
+  },
+
+  async fetchInstances(): Promise<EvolutionInstanceItem[]> {
+    const result = await request<EvolutionInstanceItem[]>(
+      `/instance/fetchInstances`,
+      { method: "GET" }
+    );
+    return Array.isArray(result) ? result : [];
+  },
+
+  /**
+   * Verifica numeros no WhatsApp e retorna o nome salvo na agenda do dono.
+   * Aceita lista; uma chamada por lote.
+   */
+  async whatsappNumbers(
+    instanceName: string,
+    numbers: string[]
+  ): Promise<EvolutionWhatsAppNumberInfo[]> {
+    if (numbers.length === 0) return [];
+    const result = await request<
+      EvolutionWhatsAppNumberInfo[] | { data?: EvolutionWhatsAppNumberInfo[] }
+    >(`/chat/whatsappNumbers/${encodeURIComponent(instanceName)}`, {
+      method: "POST",
+      body: JSON.stringify({ numbers }),
+    });
+    if (Array.isArray(result)) return result;
+    return result?.data ?? [];
+  },
+
+  async fetchProfilePictureUrl(
+    instanceName: string,
+    number: string
+  ): Promise<string | null> {
+    try {
+      const res = await request<{
+        wuid?: string;
+        profilePictureUrl?: string | null;
+      }>(`/chat/fetchProfilePictureUrl/${encodeURIComponent(instanceName)}`, {
+        method: "POST",
+        body: JSON.stringify({ number }),
+      });
+      return res?.profilePictureUrl ?? null;
+    } catch {
+      return null;
+    }
+  },
+
+  async setWebhook(instanceName: string, webhookUrl: string): Promise<unknown> {
+    try {
+      return await request<unknown>(
+        `/webhook/set/${encodeURIComponent(instanceName)}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            webhook: {
+              enabled: true,
+              url: webhookUrl,
+              byEvents: false,
+              base64: true,
+              events: [
+                "MESSAGES_UPSERT",
+                "MESSAGES_UPDATE",
+                "CONNECTION_UPDATE",
+                "CHATS_UPSERT",
+                "CHATS_UPDATE",
+              ],
+            },
+          }),
+        }
+      );
+    } catch {
+      return null;
+    }
   },
 
   isConfigured(): boolean {

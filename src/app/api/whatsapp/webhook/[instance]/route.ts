@@ -153,7 +153,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   const { data: instance } = await supabaseAdmin
     .from("whatsapp_instances")
     .select("id, company_id, evolution_token")
-    .eq("instance_name", instanceName)
+    .ilike("instance_name", instanceName)
     .maybeSingle();
   const instanceRow = instance as InstanceRow | null;
 

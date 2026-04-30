@@ -4,10 +4,15 @@ import { SettingsContent } from "@/components/settings/settings-content";
 
 interface SettingsPageProps {
   params: Promise<{ domain: string }>;
+  searchParams: Promise<{ tab?: string }>;
 }
 
-export default async function SettingsPage({ params }: SettingsPageProps) {
+export default async function SettingsPage({
+  params,
+  searchParams,
+}: SettingsPageProps) {
   const { domain } = await params;
+  const { tab } = await searchParams;
   const { user, role } = await getAuthSession();
 
   if (!user) {
@@ -18,5 +23,5 @@ export default async function SettingsPage({ params }: SettingsPageProps) {
     redirect(`/${domain}/dashboard`);
   }
 
-  return <SettingsContent canManageOperators />;
+  return <SettingsContent canManageOperators initialTab={tab} />;
 }

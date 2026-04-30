@@ -98,6 +98,14 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Re-registra o webhook caso a URL tenha mudado
+    const webhookUrl = process.env.EVOLUTION_WEBHOOK_BASE_URL
+      ? `${process.env.EVOLUTION_WEBHOOK_BASE_URL.replace(/\/$/, "")}/api/whatsapp/webhook/${encodeURIComponent(instanceName)}`
+      : null;
+    if (webhookUrl) {
+      await evolution.setWebhook(instanceName, webhookUrl);
+    }
+
     const connectRes = await evolution.connect(instanceName);
     await supabaseAdmin
       .from("whatsapp_instances")

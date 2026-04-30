@@ -38,22 +38,86 @@ function formatDate(iso: string) {
   });
 }
 
-function applyTemplate(
-  body: string,
-  ctx: {
-    paciente: string;
-    dentista: string;
-    data: string;
-    clinica: string;
-    link: string;
-  }
-) {
+interface ReminderDateParts {
+  diaSemana: string;
+  dataCalendario: string;
+  hora: string;
+  combinado: string;
+}
+
+function capitalizeFirst(s: string): string {
+  return s.length > 0 ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+function reminderDateParts(iso: string): ReminderDateParts {
+  const d = new Date(iso);
+  const diaSemana = capitalizeFirst(
+    d.toLocaleDateString("pt-BR", { weekday: "long" })
+  );
+  const dataCalendario = d.toLocaleDateString("pt-BR", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  });
+  const hora = d.toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const combinado = `${diaSemana}, ${dataCalendario} as ${hora}`;
+  return { diaSemana, dataCalendario, hora, combinado };
+}
+
+interface TemplateContext {
+  paciente: string;
+  dentista: string;
+  /** Data + hora combinados (compatibilidade com templates antigos). */
+  data: string;
+  hora: string;
+  dia_semana: string;
+  data_calendario: string;
+  clinica: string;
+  link: string;
+}
+
+function applyTemplate(body: string, ctx: TemplateContext) {
   return body
     .replaceAll("{{paciente}}", ctx.paciente)
     .replaceAll("{{dentista}}", ctx.dentista)
     .replaceAll("{{data}}", ctx.data)
+    .replaceAll("{{hora}}", ctx.hora)
+    .replaceAll("{{dia_semana}}", ctx.dia_semana)
+    .replaceAll("{{data_calendario}}", ctx.data_calendario)
     .replaceAll("{{clinica}}", ctx.clinica)
     .replaceAll("{{link}}", ctx.link);
+}
+
+/**
+ * Determina a base URL para os links de confirmacao. Em producao, a env
+ * NEXT_PUBLIC_PUBLIC_APP_URL aponta para o dominio publico (HTTPS); em dev
+ * caimos no origin do navegador, que pode ser http://localhost — neste caso
+ * a URL nao vira tocavel no WhatsApp do paciente.
+ */
+function resolveAppBaseUrl(): string {
+  const env = process.env.NEXT_PUBLIC_PUBLIC_APP_URL?.trim();
+  if (env) {
+    return env.replace(/\/+$/, "");
+  }
+  if (typeof window !== "undefined") {
+    return window.location.origin;
+  }
+  return "";
+}
+
+function isLocalOrInsecureBase(base: string): boolean {
+  if (!base) return true;
+  try {
+    const u = new URL(base);
+    if (u.protocol !== "https:") return true;
+    if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return true;
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function randomToken() {
@@ -78,6 +142,11 @@ export function AppointmentActions({
   );
   const [confirmationLink, setConfirmationLink] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
+  const [linkBaseIsLocal, setLinkBaseIsLocal] = useState(false);
+
+  useEffect(() => {
+    setLinkBaseIsLocal(isLocalOrInsecureBase(resolveAppBaseUrl()));
+  }, []);
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -153,7 +222,8 @@ export function AppointmentActions({
       }
       token = newToken;
     }
-    const link = `${window.location.origin}/${domain}/confirmar/${token}`;
+    const base = resolveAppBaseUrl();
+    const link = `${base}/${domain}/confirmar/${token}`;
     setConfirmationLink(link);
     return link;
   }
@@ -168,14 +238,28 @@ export function AppointmentActions({
       return;
     }
 
-    const ctx = {
+    const parts = reminderDateParts(appointment.starts_at);
+    const ctx: TemplateContext = {
       paciente: appointment.lead_name ?? "paciente",
       dentista: appointment.dentist_name ?? "nosso dentista",
-      data: formatDate(appointment.starts_at),
+      data: parts.combinado,
+      hora: parts.hora,
+      dia_semana: parts.diaSemana,
+      data_calendario: parts.dataCalendario,
       clinica: domain,
       link,
     };
-    const fallback = `Olá ${ctx.paciente}, podemos confirmar sua consulta em ${ctx.data} com ${ctx.dentista}? Confirme em: ${link}`;
+    const fallback = [
+      `Olá, ${ctx.paciente}! Tudo bem?`,
+      "",
+      "Passando para confirmar sua consulta:",
+      `📅 *Data:* ${ctx.dia_semana}, ${ctx.data_calendario}`,
+      `🕒 *Horário:* ${ctx.hora}`,
+      `👨‍⚕️ *Profissional:* ${ctx.dentista}`,
+      "",
+      "Para confirmar ou reagendar, acesse o link abaixo:",
+      ctx.link,
+    ].join("\n");
     const body = template ? applyTemplate(template.body, ctx) : fallback;
 
     const phone = (appointment.lead_phone ?? "").replace(/\D+/g, "");
@@ -183,6 +267,7 @@ export function AppointmentActions({
       text: body,
       leadId: appointment.lead_id,
       phone: phone || undefined,
+      linkPreview: true,
     });
     setBusy(false);
 
@@ -304,6 +389,14 @@ export function AppointmentActions({
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
             Lembrete (WhatsApp)
           </p>
+          {linkBaseIsLocal && (
+            <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+              O link do lembrete usa <code>localhost</code> e provavelmente não
+              ficará tocável no celular do paciente. Defina{" "}
+              <code>NEXT_PUBLIC_PUBLIC_APP_URL</code> com a URL pública (HTTPS)
+              da clínica para que o link vire clicável no WhatsApp.
+            </p>
+          )}
           <div className="flex flex-wrap gap-1.5">
             <button
               type="button"

@@ -17,6 +17,9 @@ const PLACEHOLDERS = [
   "{{paciente}}",
   "{{dentista}}",
   "{{data}}",
+  "{{hora}}",
+  "{{dia_semana}}",
+  "{{data_calendario}}",
   "{{clinica}}",
   "{{link}}",
 ];

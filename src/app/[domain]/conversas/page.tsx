@@ -46,7 +46,7 @@ export default async function ConversasPage({
             Configuracoes.
           </p>
           <Link
-            href={`/${domain}/settings`}
+            href={`/${domain}/settings?tab=whatsapp`}
             className="mt-4 inline-block rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
           >
             Ir para Configuracoes
@@ -56,15 +56,20 @@ export default async function ConversasPage({
     );
   }
 
+  const PAGE_SIZE = 30;
+
+  // Busca uma extra para detectar se ha mais paginas sem fazer count
   const { data: chatsData } = await supabase
     .from("whatsapp_chats")
     .select("*")
     .eq("company_id", company.id)
     .eq("is_archived", false)
     .order("last_message_at", { ascending: false, nullsFirst: false })
-    .limit(200);
+    .limit(PAGE_SIZE + 1);
 
-  const chats = (chatsData as WhatsAppChat[] | null) ?? [];
+  const allChats = (chatsData as WhatsAppChat[] | null) ?? [];
+  const hasMore = allChats.length > PAGE_SIZE;
+  const chats = hasMore ? allChats.slice(0, PAGE_SIZE) : allChats;
 
   return (
     <ConversasContent
@@ -73,6 +78,8 @@ export default async function ConversasPage({
       instance={instance}
       initialChats={chats}
       initialChatId={chat ?? null}
+      initialHasMore={hasMore}
+      pageSize={PAGE_SIZE}
     />
   );
 }

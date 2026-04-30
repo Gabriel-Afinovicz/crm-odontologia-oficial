@@ -42,3 +42,9 @@ yarn-error.log*
 next-env.d.ts
 
 .vercel
+
+# cloudflared local tunnel logs
+.cloudflared.log*
+
+# Cursor local plans / chat artifacts
+.cursor/
