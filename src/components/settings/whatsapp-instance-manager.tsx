@@ -164,9 +164,20 @@ export function WhatsAppInstanceManager() {
       body: JSON.stringify({ domain }),
     });
     setBusy(false);
-    const payload = (await res.json().catch(() => ({}))) as ConnectResponse;
+    const rawText = await res.text();
+    let payload: ConnectResponse = {};
+    try {
+      payload = rawText ? (JSON.parse(rawText) as ConnectResponse) : {};
+    } catch {
+      payload = {};
+    }
     if (!res.ok) {
-      setError(payload.error ?? "Erro ao conectar WhatsApp.");
+      const fallback = `Erro ao conectar WhatsApp. (HTTP ${res.status}${
+        rawText && !payload.error
+          ? `: ${rawText.slice(0, 160).replace(/\s+/g, " ").trim()}`
+          : ""
+      })`;
+      setError(payload.error ?? fallback);
       setShowQrModal(false);
       return;
     }
