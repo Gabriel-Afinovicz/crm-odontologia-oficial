@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { jidToPhone } from "@/lib/evolution/phone";
+import { jidToPhone, siblingJid } from "@/lib/evolution/phone";
 import type {
   WhatsAppMessageMediaType,
   WhatsAppMessageStatus,
@@ -46,6 +46,75 @@ interface ExtractedMessage {
   mediaType: WhatsAppMessageMediaType;
   mediaUrl: string | null;
   mediaMimeType: string | null;
+}
+
+interface ExtractedQuote {
+  evolutionMessageId: string | null;
+  body: string | null;
+  fromMe: boolean | null;
+}
+
+// Extrai a citacao (reply) de uma mensagem Baileys/Evolution. O contextInfo
+// pode aparecer em qualquer um dos sub-objetos de mensagem (texto/imagem/
+// audio/video/documento), entao precisamos olhar todos. O Baileys identifica
+// a mensagem citada por `stanzaId` e replica o conteudo em `quotedMessage`.
+// Para chats individuais (que sao todos os que tratamos), o `participant`
+// vem como o JID do autor da mensagem citada, e podemos compara-lo com o
+// remoteJid do chat: igual = era do contato; diferente = era nossa.
+function extractQuoted(
+  message: Record<string, unknown> | undefined | null,
+  remoteJid: string | null | undefined
+): ExtractedQuote {
+  const empty: ExtractedQuote = {
+    evolutionMessageId: null,
+    body: null,
+    fromMe: null,
+  };
+  if (!message) return empty;
+  const candidates = [
+    "extendedTextMessage",
+    "imageMessage",
+    "videoMessage",
+    "audioMessage",
+    "documentMessage",
+    "stickerMessage",
+  ];
+  for (const k of candidates) {
+    const sub = message[k] as
+      | { contextInfo?: Record<string, unknown> }
+      | undefined;
+    const ctx = sub?.contextInfo;
+    if (!ctx) continue;
+    const stanzaId =
+      typeof ctx["stanzaId"] === "string"
+        ? (ctx["stanzaId"] as string)
+        : null;
+    if (!stanzaId) continue;
+    const quotedMsg = ctx["quotedMessage"] as
+      | Record<string, unknown>
+      | undefined;
+    const quotedExtract = extractMessage(quotedMsg);
+    const participant =
+      typeof ctx["participant"] === "string"
+        ? (ctx["participant"] as string)
+        : null;
+    let fromMe: boolean | null = null;
+    if (participant && remoteJid) {
+      fromMe = participant !== remoteJid;
+    }
+    return {
+      evolutionMessageId: stanzaId,
+      body:
+        quotedExtract.body && quotedExtract.body.trim().length > 0
+          ? quotedExtract.body.slice(0, 240)
+          : quotedExtract.mediaType !== "text" &&
+              quotedExtract.mediaType !== "unknown"
+            ? `[${quotedExtract.mediaType}]`
+            : null,
+      fromMe,
+    };
+  }
+  return empty;
 }
 
 function extractMessage(message: Record<string, unknown> | undefined): ExtractedMessage {
@@ -149,6 +218,18 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   const headerApiKey = req.headers.get("apikey");
   const bodyApiKey = body.apikey;
 
+  // Log de diagnostico: serve para confirmar que a Evolution efetivamente
+  // chamou o endpoint, independente de a validacao de apikey passar.
+  // Util quando o polling a Evolution esta funcionando mas o webhook nao —
+  // sintoma classico de EVOLUTION_WEBHOOK_BASE_URL inalcancavel a partir
+  // do servidor da Evolution (ex: localhost em dev sem tunnel).
+  console.info("[webhook] received", {
+    instance: instanceName,
+    event: body.event ?? "(sem event)",
+    hasHeaderApiKey: Boolean(headerApiKey),
+    hasBodyApiKey: Boolean(bodyApiKey),
+  });
+
   const supabaseAdmin = createAdminClient();
   const { data: instance } = await supabaseAdmin
     .from("whatsapp_instances")
@@ -212,18 +293,34 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: true, ignored: "non-individual" });
     }
 
-    // Achar/criar chat
+    // Achar/criar chat. WhatsApp BR pode entregar a mesma conversa em duas
+    // formas (com e sem o nono digito); tratamos os dois JIDs como o mesmo
+    // contato para nao duplicar o chat na lista.
     let chatId: string | null = null;
     {
-      const { data: existingChat } = await supabaseAdmin
+      const candidateJids = [remoteJid];
+      const sibling = siblingJid(remoteJid);
+      if (sibling && sibling !== remoteJid) candidateJids.push(sibling);
+
+      const { data: existingChats } = await supabaseAdmin
         .from("whatsapp_chats")
-        .select("id")
+        .select("id, remote_jid")
         .eq("company_id", instanceRow.company_id)
-        .eq("remote_jid", remoteJid)
-        .maybeSingle();
-      const existing = existingChat as { id: string } | null;
-      if (existing) {
-        chatId = existing.id;
+        .in("remote_jid", candidateJids);
+
+      const existingList =
+        (existingChats as { id: string; remote_jid: string }[] | null) ?? [];
+      // Prefere o registro cujo JID bate exatamente; se so existir o irmao,
+      // usa-o (nao reescrevemos o remote_jid: a conversa continua referindo
+      // o numero como o WhatsApp originalmente entregou daquele lado).
+      const exact = existingList.find((c) => c.remote_jid === remoteJid);
+      const sibling_match = existingList.find(
+        (c) => c.remote_jid !== remoteJid
+      );
+      const matched = exact ?? sibling_match ?? null;
+
+      if (matched) {
+        chatId = matched.id;
       } else {
         const name = data.contact?.name ?? data.pushName ?? null;
         const { data: createdChat } = await supabaseAdmin
@@ -259,6 +356,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
     // messages.upsert
     const extracted = extractMessage(data.message);
+    const quoted = extractQuoted(data.message, remoteJid);
     const ts = data.messageTimestamp;
     const tsIso =
       typeof ts === "number"
@@ -293,6 +391,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       status: fromMe ? "sent" : "delivered",
       sent_at: fromMe ? tsIso : null,
       received_at: fromMe ? null : tsIso,
+      // Forca created_at para o timestamp real da mensagem. Sem isso, mensagens
+      // recebidas em rajada (p.ex. backlog ao reconectar) entram todas com
+      // created_at = NOW() e a UI (que ordena por timestamp do evento) joga as
+      // antigas para fora de ordem cronologica.
+      created_at: tsIso,
+      quoted_evolution_message_id: quoted.evolutionMessageId,
+      quoted_body: quoted.body,
+      quoted_from_me: quoted.fromMe,
     });
 
     const preview = extracted.body

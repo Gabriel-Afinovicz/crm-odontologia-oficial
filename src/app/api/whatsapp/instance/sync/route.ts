@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { requireAdminForDomain } from "@/lib/supabase/require-admin-for-domain";
 import { evolution } from "@/lib/evolution/client";
-import { jidToPhone } from "@/lib/evolution/phone";
+import { jidToPhone, siblingJid } from "@/lib/evolution/phone";
 
 interface SyncPayload {
   domain?: string;
@@ -206,7 +206,12 @@ export async function POST(req: NextRequest) {
     const resolvedName =
       savedName ?? c.pushName ?? c.name ?? phone ?? null;
 
-    const existing = existingByJid.get(c.remoteJid);
+    // Tenta JID exato; se nao existir, tenta o irmao com nono digito BR para
+    // nao criar duplicata da mesma conversa.
+    const sibling = siblingJid(c.remoteJid);
+    const existing =
+      existingByJid.get(c.remoteJid) ??
+      (sibling ? existingByJid.get(sibling) : undefined);
     if (existing) {
       // Atualiza apenas campos nao vazios para nao sobrescrever dados melhores
       const updates: Record<string, unknown> = {};

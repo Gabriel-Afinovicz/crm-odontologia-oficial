@@ -10,6 +10,7 @@ import {
 } from "react";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
+import { useSession } from "@/components/layout/session-provider";
 import type {
   Lead,
   WhatsAppChat,
@@ -92,6 +93,26 @@ function dedupeById(list: WhatsAppMessage[]): WhatsAppMessage[] {
   return Array.from(map.values());
 }
 
+// Timestamp REAL do evento da mensagem para ordenar no eixo do tempo do
+// WhatsApp (nao no eixo do "quando o webhook gravou"). Mensagens recebidas
+// em rajada (backlog do Baileys ao reconectar) podem ter created_at todos
+// proximos de NOW(); ordenar so por created_at as joga fora da ordem real
+// e visualmente o operador "perde" mensagens no scroll.
+function eventTimestamp(m: WhatsAppMessage): string {
+  return m.received_at ?? m.sent_at ?? m.created_at;
+}
+
+function compareMessagesAsc(a: WhatsAppMessage, b: WhatsAppMessage): number {
+  const at = eventTimestamp(a);
+  const bt = eventTimestamp(b);
+  if (at === bt) return 0;
+  return at < bt ? -1 : 1;
+}
+
+function sortMessagesAsc(list: WhatsAppMessage[]): WhatsAppMessage[] {
+  return [...list].sort(compareMessagesAsc);
+}
+
 // Jitter aleatorio aplicado entre envios em rajada para simular digitacao
 // humana e reduzir o risco do WhatsApp marcar o numero como bot. Mensagem
 // isolada (fila vazia no momento do clique) nao paga o custo deste delay.
@@ -133,6 +154,10 @@ export function ConversasContent({
   initialHasMore,
   pageSize,
 }: ConversasContentProps) {
+  const session = useSession();
+  const currentUserName = session.profile?.name ?? null;
+  const currentUserId = session.profile?.id ?? null;
+
   const [chats, setChats] = useState<WhatsAppChat[]>(initialChats);
   const [hasMore, setHasMore] = useState(initialHasMore);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -140,6 +165,7 @@ export function ConversasContent({
     initialChatId ?? initialChats[0]?.id ?? null
   );
   const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
+  const [usersById, setUsersById] = useState<Map<string, string>>(new Map());
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState("");
@@ -150,12 +176,52 @@ export function ConversasContent({
   const [leadOptions, setLeadOptions] = useState<Pick<Lead, "id" | "name" | "phone">[]>([]);
   const [linkedLeadName, setLinkedLeadName] = useState<string | null>(null);
   const [showContactPanel, setShowContactPanel] = useState(false);
+  const [refreshingHistory, setRefreshingHistory] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [incomingToast, setIncomingToast] = useState<{
+    chatId: string;
+    chatLabel: string;
+    preview: string;
+  } | null>(null);
+  // Reply ativo: snapshot da mensagem que sera citada no proximo envio.
+  // Mantemos o body cru aqui para a barra acima do input; o backend
+  // resolve evolution_message_id e from_me a partir do messageId.
+  const [replyingTo, setReplyingTo] = useState<{
+    messageId: string;
+    body: string;
+    fromMe: boolean;
+    senderLabel: string;
+  } | null>(null);
+  // Mensagem brevemente destacada apos clicar em uma citacao. O highlight
+  // dura ~1.5s e some — simula o "pulse" do WhatsApp ao localizar o original.
+  const [highlightedMessageId, setHighlightedMessageId] = useState<
+    string | null
+  >(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const incomingToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+  // Container de scroll do painel de mensagens. Usado para medir se o usuario
+  // esta perto do fim antes de fazer auto-scroll quando chega mensagem nova.
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // Heuristica de "perto do fim" (default true para a primeira renderizacao).
+  // Atualizado a cada onScroll do container.
+  const isNearBottomRef = useRef(true);
   // Refs para acessar valores atuais dentro de callbacks de realtime
   const hasMoreRef = useRef(hasMore);
   const chatsRef = useRef(chats);
   const activeChatIdRef = useRef(activeChatId);
+  // Mapa chatId -> timestamp do ultimo fetch a Evolution. Em ambientes onde
+  // o webhook nao consegue alcancar o servidor (ex: localhost), este loop
+  // funciona como fallback: a cada 30s o chat ATIVO pede as ultimas 10
+  // mensagens a Evolution. Como /load-history e idempotente
+  // (constraint company_id, evolution_message_id), repetir nao duplica.
+  const lastEvolutionFetchRef = useRef<Map<string, number>>(new Map());
+  // Intervalo entre fetches automaticos a Evolution para o chat ativo.
+  // 30s e um meio-termo entre frescor da conversa e nao virar rajada.
+  const EVOLUTION_POLL_INTERVAL_MS = 30_000;
   // Fila de envio: cada nova mensagem aguarda a anterior terminar para
   // garantir que cheguem ao WhatsApp na mesma ordem em que foram enviadas
   // pelo usuario, mesmo se varias forem disparadas em rapida sucessao.
@@ -169,6 +235,13 @@ export function ConversasContent({
   }, [chats]);
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  // Cancela reply em andamento quando troca de conversa: o snapshot do reply
+  // referencia uma mensagem do chat anterior; manter no state geraria envio
+  // com replyTo "fantasma" no chat novo.
+  useEffect(() => {
+    setReplyingTo(null);
   }, [activeChatId]);
 
   const activeChat = useMemo(
@@ -187,10 +260,15 @@ export function ConversasContent({
     });
   }, [chats, search]);
 
-  // Defesa final: sempre renderiza mensagens deduplicadas por id, evitando
-  // o warning "two children with the same key" e bubbles duplicados na UI
-  // mesmo se algum cenario raro acabar inserindo duplicatas no state.
-  const renderedMessages = useMemo(() => dedupeById(messages), [messages]);
+  // Defesa final: sempre renderiza mensagens deduplicadas por id e ordenadas
+  // pelo timestamp real do evento (received_at/sent_at), nao por created_at.
+  // Sem essa ordenacao, mensagens recebidas em backlog (com created_at = NOW
+  // do webhook) caem fora de ordem cronologica e o scroll automatico para o
+  // fim da lista esconde o que veio "antes" no eixo do WhatsApp.
+  const renderedMessages = useMemo(
+    () => sortMessagesAsc(dedupeById(messages)),
+    [messages]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -212,10 +290,45 @@ export function ConversasContent({
         .limit(500);
       if (cancelled) return;
       const fresh = (data as WhatsAppMessage[] | null) ?? [];
-      // Garante dedup ja na carga inicial caso o banco ou o realtime gerem
-      // alguma duplicacao logica.
+
+      // Mostra imediatamente o que ja temos em cache local (banco) para nao
+      // bloquear a UI enquanto pedimos historico fresco a Evolution.
       setMessages(dedupeById(fresh));
       setLoadingMessages(false);
+
+      // Sempre puxa as ultimas 50 mensagens da Evolution na primeira
+      // abertura desta conversa nesta sessao — assim o operador entra com
+      // contexto suficiente para uma conversa fluida, mesmo que o webhook
+      // ainda nao tenha entregue tudo. O endpoint /load-history e idempotente
+      // (filtra por (company_id, evolution_message_id)), entao nao duplica
+      // mensagens ja gravadas. Atualizacoes subsequentes ficam por conta do
+      // loop de polling automatico (a cada 30s) ou do botao manual.
+      const lastFetch = lastEvolutionFetchRef.current.get(activeChatId) ?? 0;
+      if (Date.now() - lastFetch > EVOLUTION_POLL_INTERVAL_MS) {
+        lastEvolutionFetchRef.current.set(activeChatId, Date.now());
+        try {
+          const res = await fetch("/api/whatsapp/messages/load-history", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chatId: activeChatId, limit: 50 }),
+          });
+          if (res.ok) {
+            const { data: refreshed } = await supabase
+              .from("whatsapp_messages")
+              .select("*")
+              .eq("chat_id", activeChatId)
+              .order("created_at", { ascending: true })
+              .limit(500);
+            if (cancelled) return;
+            const list = (refreshed as WhatsAppMessage[] | null) ?? [];
+            setMessages(dedupeById(list));
+          }
+        } catch {
+          // Silencioso: se a Evolution nao tiver historico ou a chamada falhar,
+          // a UI segue mostrando o que ja havia em cache local e novas
+          // mensagens chegam normalmente pelo webhook + realtime.
+        }
+      }
     })();
     return () => {
       cancelled = true;
@@ -241,10 +354,36 @@ export function ConversasContent({
     })();
   }, [activeChatId, chats]);
 
-  // Scroll to bottom on messages change
+  // Auto-scroll inteligente: SO desce automaticamente se o usuario ja estava
+  // perto do fim. Isso preserva a posicao de leitura quando o operador esta
+  // rolando o historico para cima e o polling/realtime entrega novas mensagens.
   useEffect(() => {
+    if (!isNearBottomRef.current) return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
+
+  // Trocar de conversa SEMPRE leva ao fim (comportamento esperado: abrir o
+  // chat ja mostrando a mensagem mais recente).
+  useEffect(() => {
+    if (!activeChatId) return;
+    isNearBottomRef.current = true;
+    // 'auto' sem animacao para nao parecer um scroll automatico estranho.
+    requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    });
+  }, [activeChatId]);
+
+  // Mede a distancia ate o fim para decidir se um proximo update deve dar
+  // auto-scroll. Threshold em px considera margem de seguranca para evitar
+  // que pequenos ajustes de altura de bolha (ex: status virando "lida") nao
+  // sejam interpretados como "usuario subiu".
+  function handleMessagesScroll() {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom < 150;
+  }
 
   // Realtime: chats e messages da company.
   // Importante: NAO usamos filter no servidor (postgres_changes filter)
@@ -311,8 +450,37 @@ export function ConversasContent({
           if (next.company_id !== companyId) return;
           // Usa ref para sempre ler o activeChatId atual; o canal nao re-subscreve
           // ao trocar de conversa, evitando perder mensagens em transito.
-          if (next.chat_id !== activeChatIdRef.current) return;
-          setMessages((prev) => upsertMessage(prev, next));
+          if (next.chat_id === activeChatIdRef.current) {
+            setMessages((prev) => upsertMessage(prev, next));
+            return;
+          }
+          // Mensagem chegou em chat diferente do ativo: se for IN, mostra
+          // um toast discreto para o operador notar a notificacao mesmo
+          // sem olhar a lista lateral. Eventos OUT (envio do proprio CRM
+          // para outro chat, ou eco do celular) nao geram toast.
+          if (payload.eventType !== "INSERT") return;
+          if (next.from_me) return;
+          const chatRef = chatsRef.current.find((c) => c.id === next.chat_id);
+          const chatLabel =
+            chatRef?.name ?? chatRef?.remote_jid?.replace(/@.*$/, "") ?? "Nova mensagem";
+          const previewBody =
+            next.body && next.body.trim().length > 0
+              ? next.body
+              : next.media_type !== "text"
+                ? `[${next.media_type}]`
+                : "(sem conteudo)";
+          setIncomingToast({
+            chatId: next.chat_id,
+            chatLabel,
+            preview: previewBody.slice(0, 120),
+          });
+          if (incomingToastTimerRef.current) {
+            clearTimeout(incomingToastTimerRef.current);
+          }
+          incomingToastTimerRef.current = setTimeout(() => {
+            setIncomingToast(null);
+            incomingToastTimerRef.current = null;
+          }, 4000);
         }
       )
       .subscribe((status) => {
@@ -323,13 +491,18 @@ export function ConversasContent({
 
     return () => {
       supabase.removeChannel(channel);
+      if (incomingToastTimerRef.current) {
+        clearTimeout(incomingToastTimerRef.current);
+        incomingToastTimerRef.current = null;
+      }
     };
   }, [companyId]);
 
-  // Polling de seguranca: a cada 10s busca mensagens recentes do chat ativo
-  // e da o chat list. Funciona como fallback caso o WebSocket de Realtime
-  // esteja temporariamente desconectado ou um evento se perca. Usa upsertMessage
-  // para nao gerar duplicacoes.
+  // Polling de seguranca: a cada 10s sincroniza o que esta no banco (lista
+  // de chats e mensagens do chat ativo) e, em paralelo, a cada 30s pede a
+  // Evolution as ultimas mensagens do chat ativo. O segundo loop e o
+  // FALLBACK para ambientes onde o webhook nao consegue alcancar o servidor
+  // (ex: localhost em dev) — sem ele, mensagens recebidas nunca apareceriam.
   useEffect(() => {
     const supabase = createClient();
     let cancelled = false;
@@ -376,19 +549,54 @@ export function ConversasContent({
       });
     }
 
+    // Pede a Evolution as ultimas mensagens do chat ativo, respeitando o
+    // intervalo minimo entre fetches por chat. limit=10 porque so queremos
+    // o "delta" recente; histórico ja foi carregado no abrir do chat.
+    // Se forceFresh=true, ignora o intervalo (usado ao voltar a aba ao foco).
+    async function pullEvolutionForActive(forceFresh = false) {
+      const chatId = activeChatIdRef.current;
+      if (!chatId) return;
+      const lastFetch = lastEvolutionFetchRef.current.get(chatId) ?? 0;
+      if (
+        !forceFresh &&
+        Date.now() - lastFetch < EVOLUTION_POLL_INTERVAL_MS
+      ) {
+        return;
+      }
+      lastEvolutionFetchRef.current.set(chatId, Date.now());
+      try {
+        const res = await fetch("/api/whatsapp/messages/load-history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId, limit: 10 }),
+        });
+        if (!res.ok) return;
+        // Apos a Evolution gravar no banco, deixa o syncActiveChat puxar do
+        // banco no proximo tick (ou agora) para alimentar o state com o que
+        // veio. Realtime tambem entrega, mas em fallback sem websocket o
+        // syncActiveChat garante a atualizacao.
+        await syncActiveChat();
+      } catch {
+        // Silencioso: a tentativa volta no proximo intervalo.
+      }
+    }
+
     function tick() {
       if (document.hidden) return;
       void syncActiveChat();
       void syncChatList();
+      void pullEvolutionForActive(false);
     }
 
     const interval = setInterval(tick, 10000);
 
     function onVisibility() {
       if (!document.hidden) {
-        // Forca um sync imediato quando a aba volta ao foco
+        // Forca um sync imediato quando a aba volta ao foco. Evolution e
+        // marcada com forceFresh para nao depender do timer de 30s.
         void syncActiveChat();
         void syncChatList();
+        void pullEvolutionForActive(true);
       }
     }
     document.addEventListener("visibilitychange", onVisibility);
@@ -399,6 +607,29 @@ export function ConversasContent({
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [companyId, pageSize]);
+
+  // Mapa userId -> nome para identificar quem enviou cada mensagem pelo CRM.
+  // O numero do WhatsApp e o mesmo para todos os operadores; sem esse rotulo
+  // nao da pra saber quem digitou no CRM. Carrega uma vez por company.
+  useEffect(() => {
+    let cancelled = false;
+    const supabase = createClient();
+    (async () => {
+      const { data } = await supabase
+        .from("users")
+        .select("id, name")
+        .eq("company_id", companyId);
+      if (cancelled) return;
+      const next = new Map<string, string>();
+      for (const u of (data as { id: string; name: string }[] | null) ?? []) {
+        next.set(u.id, u.name);
+      }
+      setUsersById(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [companyId]);
 
   const leadIdForName = activeChat?.lead_id ?? null;
   useEffect(() => {
@@ -444,6 +675,59 @@ export function ConversasContent({
     return () => clearTimeout(t);
   }, [showLinkLead, leadSearch, companyId]);
 
+  // Inicia um reply: a barra acima do input vai mostrar a citacao e o
+  // proximo envio sera enviado com `replyToMessageId`.
+  function startReply(message: WhatsAppMessage) {
+    const senderLabel = message.from_me
+      ? "Voce"
+      : activeChat?.name || jidToPhoneDisplay(activeChat?.remote_jid ?? "");
+    const previewBody =
+      message.body && message.body.trim().length > 0
+        ? message.body
+        : message.media_type !== "text"
+          ? `[${message.media_type}]`
+          : "(sem conteudo)";
+    setReplyingTo({
+      messageId: message.id,
+      body: previewBody,
+      fromMe: message.from_me,
+      senderLabel,
+    });
+  }
+
+  function cancelReply() {
+    setReplyingTo(null);
+  }
+
+  // Localiza a mensagem original a partir do evolution_message_id citado
+  // e rola ate ela. Se a mensagem nao esta carregada (historico curto),
+  // nao faz nada — em uma versao futura podemos pedir paginacao.
+  function jumpToQuote(quotedEvoId: string) {
+    const target = renderedMessages.find(
+      (m) => m.evolution_message_id === quotedEvoId
+    );
+    if (!target) return;
+    const el = document.querySelector<HTMLElement>(
+      `[data-msg-id="${target.id}"]`
+    );
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedMessageId(target.id);
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = setTimeout(() => {
+      setHighlightedMessageId(null);
+      highlightTimerRef.current = null;
+    }, 1500);
+  }
+
+  // Limpeza do timer de highlight ao desmontar para evitar update em
+  // componente desmontado se o usuario sai da pagina logo apos clicar.
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    };
+  }, []);
+
   function handleSend(e?: FormEvent) {
     e?.preventDefault();
     const text = draft.trim();
@@ -451,6 +735,10 @@ export function ConversasContent({
     const chatIdAtSend = activeChat.id;
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const nowIso = new Date().toISOString();
+    // Snapshot do reply atual: o backend pode resolver `replyToMessageId`,
+    // mas a mensagem otimista precisa do snapshot agora para o usuario ver
+    // o quote imediatamente, sem esperar o realtime entregar a mensagem real.
+    const replySnapshot = replyingTo;
 
     // Mensagem otimista para feedback imediato na UI, sem depender do realtime
     const optimistic: WhatsAppMessage = {
@@ -469,11 +757,15 @@ export function ConversasContent({
       sent_at: null,
       received_at: null,
       sender_user_id: null,
+      quoted_evolution_message_id: null,
+      quoted_body: replySnapshot ? replySnapshot.body.slice(0, 240) : null,
+      quoted_from_me: replySnapshot ? replySnapshot.fromMe : null,
       created_at: nowIso,
     };
     setMessages((prev) => [...prev, optimistic]);
     setDraft("");
     setSendError(null);
+    setReplyingTo(null);
     // Captura se a fila estava vazia ANTES de incrementar o contador.
     // Mensagem isolada nao paga o custo do jitter; rajada paga.
     const wasQueueEmpty = pendingSendsRef.current === 0;
@@ -498,7 +790,11 @@ export function ConversasContent({
         const res = await fetch("/api/whatsapp/messages/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chatId: chatIdAtSend, text }),
+          body: JSON.stringify({
+            chatId: chatIdAtSend,
+            text,
+            replyToMessageId: replySnapshot?.messageId,
+          }),
         });
         if (!res.ok) {
           const payload = (await res.json().catch(() => ({}))) as { error?: string };
@@ -552,6 +848,11 @@ export function ConversasContent({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+      return;
+    }
+    if (e.key === "Escape" && replyingTo) {
+      e.preventDefault();
+      cancelReply();
     }
   }
 
@@ -573,6 +874,44 @@ export function ConversasContent({
       .from("whatsapp_chats")
       .update({ lead_id: null })
       .eq("id", activeChat.id);
+  }
+
+  // Refresh manual: pede a Evolution as ultimas 50 mensagens do chat ativo
+  // e refaz o select local. Ignora o intervalo de polling de proposito —
+  // se o operador clicou, ele quer reapurar agora.
+  async function refreshHistory() {
+    const chatId = activeChatIdRef.current;
+    if (!chatId || refreshingHistory) return;
+    setRefreshingHistory(true);
+    setRefreshError(null);
+    try {
+      const res = await fetch("/api/whatsapp/messages/load-history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId, limit: 50 }),
+      });
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as { error?: string };
+        setRefreshError(payload.error ?? "Falha ao recarregar mensagens.");
+        return;
+      }
+      const supabase = createClient();
+      const { data } = await supabase
+        .from("whatsapp_messages")
+        .select("*")
+        .eq("chat_id", chatId)
+        .order("created_at", { ascending: true })
+        .limit(500);
+      // Reinicia o relogio do polling automatico para nao disparar de novo
+      // logo em seguida — ja acabamos de buscar 50 msgs.
+      lastEvolutionFetchRef.current.set(chatId, Date.now());
+      const list = (data as WhatsAppMessage[] | null) ?? [];
+      setMessages(dedupeById(list));
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : "Erro de rede.");
+    } finally {
+      setRefreshingHistory(false);
+    }
   }
 
   async function loadMore() {
@@ -638,6 +977,7 @@ export function ConversasContent({
             ) : (
               filteredChats.map((c) => {
                 const active = c.id === activeChatId;
+                const hasUnread = c.unread_count > 0 && !active;
                 return (
                   <button
                     key={c.id}
@@ -659,20 +999,41 @@ export function ConversasContent({
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-sm font-medium text-gray-900">
+                        <p
+                          className={`truncate text-sm text-gray-900 ${
+                            hasUnread ? "font-semibold" : "font-medium"
+                          }`}
+                        >
                           {c.name || jidToPhoneDisplay(c.remote_jid)}
                         </p>
-                        <span className="shrink-0 text-[10px] text-gray-400">
+                        <span
+                          className={`shrink-0 text-[10px] ${
+                            hasUnread
+                              ? "font-semibold text-emerald-600"
+                              : "text-gray-400"
+                          }`}
+                        >
                           {fmtTime(c.last_message_at)}
                         </span>
                       </div>
                       <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-xs text-gray-500">
+                        <p
+                          className={`truncate text-xs ${
+                            hasUnread
+                              ? "font-medium text-gray-700"
+                              : "text-gray-500"
+                          }`}
+                        >
                           {c.last_message_preview ?? "—"}
                         </p>
-                        {c.unread_count > 0 && !active && (
-                          <span className="ml-2 rounded-full bg-emerald-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                            {c.unread_count}
+                        {hasUnread && (
+                          <span
+                            aria-label={`${c.unread_count} mensagem${
+                              c.unread_count === 1 ? "" : "s"
+                            } nao lida${c.unread_count === 1 ? "" : "s"}`}
+                            className="ml-2 inline-flex min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-emerald-500 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white shadow-sm"
+                          >
+                            {c.unread_count > 99 ? "99+" : c.unread_count}
                           </span>
                         )}
                       </div>
@@ -762,10 +1123,44 @@ export function ConversasContent({
                       Vincular a lead
                     </button>
                   )}
+                  <button
+                    type="button"
+                    onClick={refreshHistory}
+                    disabled={refreshingHistory}
+                    title={
+                      refreshingHistory
+                        ? "Recarregando..."
+                        : "Recarregar ultimas mensagens"
+                    }
+                    aria-label="Recarregar ultimas mensagens"
+                    className="inline-flex items-center justify-center rounded-lg border border-gray-200 p-1.5 text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className={refreshingHistory ? "animate-spin" : ""}
+                    >
+                      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+                      <path d="M21 3v5h-5" />
+                      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+                      <path d="M8 16H3v5" />
+                    </svg>
+                  </button>
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto px-6 py-4">
+              <div
+                ref={scrollContainerRef}
+                onScroll={handleMessagesScroll}
+                className="flex-1 overflow-y-auto px-6 py-4"
+              >
                 {loadingMessages ? (
                   <div className="text-center text-xs text-gray-400">
                     Carregando mensagens...
@@ -777,16 +1172,81 @@ export function ConversasContent({
                 ) : (
                   <div className="flex flex-col gap-1.5">
                     {renderedMessages.map((m) => (
-                      <MessageBubble key={m.id} message={m} />
+                      <MessageBubble
+                        key={m.id}
+                        message={m}
+                        senderName={resolveSenderName(
+                          m,
+                          usersById,
+                          currentUserId,
+                          currentUserName
+                        )}
+                        onReply={startReply}
+                        onJumpToQuote={jumpToQuote}
+                        highlighted={highlightedMessageId === m.id}
+                        contactName={
+                          activeChat?.name ??
+                          jidToPhoneDisplay(activeChat?.remote_jid ?? "")
+                        }
+                      />
                     ))}
                   </div>
                 )}
                 <div ref={messagesEndRef} />
               </div>
 
+              {refreshError && (
+                <div className="border-t border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
+                  {refreshError}
+                </div>
+              )}
               {sendError && (
                 <div className="border-t border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700">
                   {sendError}
+                </div>
+              )}
+              {replyingTo && (
+                <div className="flex items-stretch gap-3 border-t border-gray-200 bg-gray-50 px-4 py-2">
+                  <div
+                    className={`w-1 shrink-0 rounded-full ${
+                      replyingTo.fromMe ? "bg-emerald-500" : "bg-blue-500"
+                    }`}
+                    aria-hidden
+                  />
+                  <div className="min-w-0 flex-1 py-1">
+                    <p
+                      className={`truncate text-[11px] font-semibold ${
+                        replyingTo.fromMe ? "text-emerald-700" : "text-blue-700"
+                      }`}
+                    >
+                      Respondendo a {replyingTo.senderLabel}
+                    </p>
+                    <p className="mt-0.5 truncate text-xs text-gray-600">
+                      {replyingTo.body}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={cancelReply}
+                    className="shrink-0 self-start rounded-full p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700"
+                    aria-label="Cancelar resposta"
+                    title="Cancelar resposta"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
                 </div>
               )}
               <form
@@ -818,6 +1278,48 @@ export function ConversasContent({
           )}
         </section>
       </div>
+
+      {incomingToast && (
+        <button
+          type="button"
+          onClick={() => {
+            setActiveChatId(incomingToast.chatId);
+            setIncomingToast(null);
+            if (incomingToastTimerRef.current) {
+              clearTimeout(incomingToastTimerRef.current);
+              incomingToastTimerRef.current = null;
+            }
+          }}
+          className="fixed bottom-6 right-6 z-50 flex max-w-sm items-start gap-3 rounded-xl border border-emerald-200 bg-white px-4 py-3 text-left shadow-lg transition-transform hover:-translate-y-0.5 hover:shadow-xl"
+        >
+          <span
+            aria-hidden
+            className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+            </svg>
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-semibold text-gray-900">
+              Nova mensagem de {incomingToast.chatLabel}
+            </span>
+            <span className="mt-0.5 block truncate text-xs text-gray-600">
+              {incomingToast.preview}
+            </span>
+          </span>
+        </button>
+      )}
 
       {showContactPanel && activeChat && (
         <ContactPanel
@@ -1109,45 +1611,182 @@ function ContactPanel({
   );
 }
 
-function MessageBubble({ message }: { message: WhatsAppMessage }) {
+// Resolve qual nome exibir acima da bolha de uma mensagem enviada (from_me).
+// - Mensagens enviadas pelo CRM ja salvam sender_user_id no banco; basta
+//   buscar no mapa de usuarios da company.
+// - Para mensagem otimista (id "temp-..."), o sender_user_id ainda nao foi
+//   gravado, mas sabemos que e o operador logado.
+// - Mensagem from_me sem sender_user_id e que nao e otimista: foi enviada
+//   diretamente pelo aparelho conectado, fora do CRM.
+function resolveSenderName(
+  message: WhatsAppMessage,
+  usersById: Map<string, string>,
+  currentUserId: string | null,
+  currentUserName: string | null
+): string | null {
+  if (!message.from_me) return null;
+  if (message.sender_user_id) {
+    return usersById.get(message.sender_user_id) ?? "Operador";
+  }
+  if (message.id.startsWith("temp-")) {
+    return currentUserName ?? (currentUserId ? "Operador" : null);
+  }
+  return "Enviado pelo celular";
+}
+
+function MessageBubble({
+  message,
+  senderName,
+  onReply,
+  onJumpToQuote,
+  highlighted,
+  contactName,
+}: {
+  message: WhatsAppMessage;
+  senderName: string | null;
+  onReply: (message: WhatsAppMessage) => void;
+  onJumpToQuote: (quotedEvoId: string) => void;
+  highlighted: boolean;
+  contactName: string;
+}) {
   const isMe = message.from_me;
   const time = fmtTime(
     message.received_at ?? message.sent_at ?? message.created_at
   );
+  const isExternal = senderName === "Enviado pelo celular";
+  const hasQuote = Boolean(message.quoted_body);
+  // Mensagem otimista (temp-) ainda nao tem id real no banco; nao podemos
+  // usar como replyTo porque o backend nao consegue resolver evolution_message_id.
+  const canReply = !message.id.startsWith("temp-");
+
+  function handleReplyClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    onReply(message);
+  }
+
+  function handleQuoteClick() {
+    if (message.quoted_evolution_message_id) {
+      onJumpToQuote(message.quoted_evolution_message_id);
+    }
+  }
+
   return (
-    <div className={`flex ${isMe ? "justify-end" : "justify-start"}`}>
+    <div
+      data-msg-id={message.id}
+      data-evo-id={message.evolution_message_id ?? ""}
+      className={`group/msg flex flex-col ${
+        isMe ? "items-end" : "items-start"
+      } ${highlighted ? "animate-pulse" : ""}`}
+    >
+      {isMe && senderName && (
+        <span
+          className={`mb-0.5 px-1 text-[10px] font-medium ${
+            isExternal ? "text-gray-400 italic" : "text-emerald-700"
+          }`}
+        >
+          {senderName}
+        </span>
+      )}
       <div
-        className={`max-w-[70%] rounded-2xl px-3 py-2 text-sm shadow-sm ${
-          isMe
-            ? "bg-emerald-100 text-emerald-900"
-            : "bg-white text-gray-900 border border-gray-200"
+        className={`relative flex max-w-[70%] items-start gap-1.5 ${
+          isMe ? "flex-row-reverse" : "flex-row"
         }`}
       >
-        {message.body ? (
-          <p className="whitespace-pre-wrap break-words">{message.body}</p>
-        ) : message.media_type !== "text" ? (
-          <p className="italic text-gray-500">[{message.media_type}]</p>
-        ) : null}
-        <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-gray-500">
-          <span>{time}</span>
-          {isMe && (
-            <span aria-label={`Status: ${message.status}`}>
-              {message.status === "read"
-                ? "lida"
-                : message.status === "delivered"
-                  ? "entregue"
-                  : message.status === "sent"
-                    ? "enviada"
-                    : message.status === "failed"
-                      ? "falhou"
-                      : "..."}
-            </span>
+        <div
+          className={`min-w-0 rounded-2xl px-3 py-2 text-sm shadow-sm transition-shadow ${
+            isMe
+              ? "bg-emerald-100 text-emerald-900"
+              : "bg-white text-gray-900 border border-gray-200"
+          } ${highlighted ? "ring-2 ring-emerald-400 ring-offset-1" : ""}`}
+        >
+          {hasQuote && (
+            <button
+              type="button"
+              onClick={handleQuoteClick}
+              disabled={!message.quoted_evolution_message_id}
+              className={`mb-1 flex w-full items-stretch gap-2 rounded-lg px-2 py-1.5 text-left transition-colors ${
+                isMe
+                  ? "bg-emerald-50/80 hover:bg-emerald-50"
+                  : "bg-gray-50 hover:bg-gray-100"
+              } disabled:cursor-default`}
+              title={
+                message.quoted_evolution_message_id
+                  ? "Ir para mensagem original"
+                  : undefined
+              }
+            >
+              <span
+                aria-hidden
+                className={`w-0.5 shrink-0 rounded-full ${
+                  message.quoted_from_me ? "bg-emerald-500" : "bg-blue-500"
+                }`}
+              />
+              <span className="min-w-0 flex-1">
+                <span
+                  className={`block truncate text-[11px] font-semibold ${
+                    message.quoted_from_me
+                      ? "text-emerald-700"
+                      : "text-blue-700"
+                  }`}
+                >
+                  {message.quoted_from_me ? "Voce" : contactName}
+                </span>
+                <span className="mt-0.5 block truncate text-xs text-gray-600">
+                  {message.quoted_body}
+                </span>
+              </span>
+            </button>
+          )}
+          {message.body ? (
+            <p className="whitespace-pre-wrap break-words">{message.body}</p>
+          ) : message.media_type !== "text" ? (
+            <p className="italic text-gray-500">[{message.media_type}]</p>
+          ) : null}
+          <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-gray-500">
+            <span>{time}</span>
+            {isMe && (
+              <span aria-label={`Status: ${message.status}`}>
+                {message.status === "read"
+                  ? "lida"
+                  : message.status === "delivered"
+                    ? "entregue"
+                    : message.status === "sent"
+                      ? "enviada"
+                      : message.status === "failed"
+                        ? "falhou"
+                        : "..."}
+              </span>
+            )}
+          </div>
+          {message.error_message && (
+            <p className="mt-1 text-[10px] text-red-600">
+              {message.error_message}
+            </p>
           )}
         </div>
-        {message.error_message && (
-          <p className="mt-1 text-[10px] text-red-600">
-            {message.error_message}
-          </p>
+        {canReply && (
+          <button
+            type="button"
+            onClick={handleReplyClick}
+            aria-label="Responder mensagem"
+            title="Responder"
+            className="mt-1 inline-flex h-7 w-7 shrink-0 items-center justify-center self-start rounded-full bg-white text-gray-500 opacity-0 shadow-sm ring-1 ring-gray-200 transition-opacity hover:bg-gray-50 hover:text-emerald-600 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-emerald-400 group-hover/msg:opacity-100"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <polyline points="9 17 4 12 9 7" />
+              <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+            </svg>
+          </button>
         )}
       </div>
     </div>

@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "tunnel": "cloudflared tunnel --url http://localhost:3000",
+    "tunnel:named": "cloudflared tunnel run %CLOUDFLARED_TUNNEL_NAME%"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

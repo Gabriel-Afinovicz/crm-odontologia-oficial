@@ -16,6 +16,13 @@ interface SendPayload {
    * lembretes/confirmacoes que carregam links viram tocaveis no WhatsApp.
    */
   linkPreview?: boolean;
+  /**
+   * Quando presente, a mensagem e enviada como reply (citacao estilo WhatsApp)
+   * a esta mensagem. Aceita o uuid local de whatsapp_messages.id; o backend
+   * resolve o evolution_message_id e o body para passar a Evolution e gravar
+   * o snapshot junto com a nova mensagem.
+   */
+  replyToMessageId?: string;
 }
 
 interface InstanceRow {
@@ -198,6 +205,50 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Resolve a mensagem citada (reply) ANTES de enviar. Precisamos do
+  // evolution_message_id da mensagem original para que o WhatsApp do
+  // destinatario consiga renderizar o quote ligado a mensagem real (e nao
+  // como uma string solta). Tambem guardamos snapshot para nossa UI.
+  let quotedSnapshot: {
+    evolutionMessageId: string;
+    fromMe: boolean;
+    body: string | null;
+    mediaType: string;
+  } | null = null;
+  if (body.replyToMessageId) {
+    const { data: original } = await supabaseAdmin
+      .from("whatsapp_messages")
+      .select(
+        "id, company_id, chat_id, evolution_message_id, from_me, body, media_type"
+      )
+      .eq("id", body.replyToMessageId)
+      .maybeSingle();
+    const originalRow = original as {
+      id: string;
+      company_id: string;
+      chat_id: string;
+      evolution_message_id: string | null;
+      from_me: boolean;
+      body: string | null;
+      media_type: string;
+    } | null;
+    if (
+      originalRow &&
+      originalRow.company_id === companyId &&
+      originalRow.chat_id === chatRow.id &&
+      originalRow.evolution_message_id
+    ) {
+      quotedSnapshot = {
+        evolutionMessageId: originalRow.evolution_message_id,
+        fromMe: originalRow.from_me,
+        body: originalRow.body,
+        mediaType: originalRow.media_type,
+      };
+    }
+    // Se a mensagem citada nao foi encontrada/elegivel, seguimos sem reply
+    // em vez de falhar o envio: a mensagem ainda chega, so nao vai com quote.
+  }
+
   // Envia via Evolution PRIMEIRO para obter evolution_message_id, e so depois
   // insere no banco (ja com o id). Isso elimina o race condition em que o
   // webhook chegava antes da update e inseria uma duplicata.
@@ -213,7 +264,17 @@ export async function POST(req: NextRequest) {
       instanceRow.instance_name,
       targetJid,
       text,
-      { linkPreview: wantsLinkPreview }
+      {
+        linkPreview: wantsLinkPreview,
+        quoted: quotedSnapshot
+          ? {
+              evolutionMessageId: quotedSnapshot.evolutionMessageId,
+              fromMe: quotedSnapshot.fromMe,
+              remoteJid: targetJid,
+              body: quotedSnapshot.body,
+            }
+          : undefined,
+      }
     );
     evoMessageId = sendRes.key?.id ?? null;
   } catch (err) {
@@ -239,6 +300,15 @@ export async function POST(req: NextRequest) {
     messageId = (existing as { id: string } | null)?.id ?? null;
   }
 
+  // Snapshot do quote para UI: corpo curto (preview) e flag se era nossa.
+  // Para midias sem caption guardamos um placeholder do tipo, igual o que
+  // mostramos na lista lateral, para o quote nunca ficar vazio.
+  const quotedBodyForDb = quotedSnapshot
+    ? quotedSnapshot.body && quotedSnapshot.body.trim().length > 0
+      ? quotedSnapshot.body.slice(0, 240)
+      : `[${quotedSnapshot.mediaType}]`
+    : null;
+
   if (!messageId) {
     const { data: inserted, error: insertErr } = await supabaseAdmin
       .from("whatsapp_messages")
@@ -252,6 +322,10 @@ export async function POST(req: NextRequest) {
         status: "sent",
         sent_at: sentAt,
         sender_user_id: profileRow.id,
+        quoted_evolution_message_id:
+          quotedSnapshot?.evolutionMessageId ?? null,
+        quoted_body: quotedBodyForDb,
+        quoted_from_me: quotedSnapshot?.fromMe ?? null,
       })
       .select("id")
       .single();
@@ -264,9 +338,17 @@ export async function POST(req: NextRequest) {
     messageId = (inserted as { id: string }).id;
   } else {
     // Webhook ja inseriu; complementa com sender_user_id que ele nao tem.
+    // Tambem completa o quote (o webhook ja extrai do contextInfo, mas pode
+    // chegar antes ou nao trazer o snapshot completo dependendo do payload).
+    const update: Record<string, unknown> = { sender_user_id: profileRow.id };
+    if (quotedSnapshot) {
+      update.quoted_evolution_message_id = quotedSnapshot.evolutionMessageId;
+      update.quoted_body = quotedBodyForDb;
+      update.quoted_from_me = quotedSnapshot.fromMe;
+    }
     await supabaseAdmin
       .from("whatsapp_messages")
-      .update({ sender_user_id: profileRow.id })
+      .update(update)
       .eq("id", messageId);
   }
 

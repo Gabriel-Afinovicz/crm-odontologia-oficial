@@ -428,6 +428,14 @@ export interface WhatsAppMessage {
   sent_at: string | null;
   received_at: string | null;
   sender_user_id: string | null;
+  // Reply ao estilo WhatsApp: snapshot do que foi citado. Sem FK para a
+  // mensagem original porque ela pode nao existir no banco (mensagem antiga
+  // que ainda nao foi sincronizada). quoted_evolution_message_id e a chave
+  // soft para tentar localizar a mensagem original quando precisarmos rolar
+  // ate ela na UI.
+  quoted_evolution_message_id: string | null;
+  quoted_body: string | null;
+  quoted_from_me: boolean | null;
   created_at: string;
 }
 
@@ -667,6 +675,9 @@ export interface Database {
           | "sent_at"
           | "received_at"
           | "sender_user_id"
+          | "quoted_evolution_message_id"
+          | "quoted_body"
+          | "quoted_from_me"
         > &
           Partial<
             Pick<
@@ -682,6 +693,9 @@ export interface Database {
               | "sent_at"
               | "received_at"
               | "sender_user_id"
+              | "quoted_evolution_message_id"
+              | "quoted_body"
+              | "quoted_from_me"
             >
           >;
         Update: Partial<Omit<WhatsAppMessage, "id" | "created_at">>;

@@ -40,3 +40,41 @@ export function isIndividualJid(jid: string | null | undefined): boolean {
   if (!jid) return false;
   return jid.endsWith("@s.whatsapp.net");
 }
+
+/**
+ * Para JIDs individuais brasileiros (DDI 55, celular), retorna o JID
+ * "irmao" alternando o nono digito que foi adicionado a celulares fora
+ * de SP/RJ. WhatsApp pode entregar a mesma conversa em qualquer das duas
+ * formas; precisamos tratar como mesmo contato.
+ *
+ * Formato esperado:
+ *   - sem 9: 55 + DDD(2) + numero(8) = 12 digitos -> adiciona "9" entre DDD e numero
+ *   - com 9: 55 + DDD(2) + 9 + numero(8) = 13 digitos com posicao[4]==='9'
+ *            -> remove o "9"
+ *
+ * Numeros que nao se encaixam (fixos com 8 digitos sem celular, outros DDIs,
+ * grupos, etc) retornam null.
+ */
+export function siblingJid(jid: string | null | undefined): string | null {
+  if (!jid) return null;
+  if (!isIndividualJid(jid)) return null;
+  const digits = jidToPhone(jid);
+  if (!/^\d+$/.test(digits)) return null;
+  if (!digits.startsWith("55")) return null;
+
+  if (digits.length === 12) {
+    // 55 DD NNNNNNNN  -> 55 DD 9 NNNNNNNN
+    const ddd = digits.slice(2, 4);
+    const local = digits.slice(4);
+    const expanded = `55${ddd}9${local}`;
+    return `${expanded}@s.whatsapp.net`;
+  }
+  if (digits.length === 13 && digits[4] === "9") {
+    // 55 DD 9 NNNNNNNN -> 55 DD NNNNNNNN
+    const ddd = digits.slice(2, 4);
+    const local = digits.slice(5);
+    const reduced = `55${ddd}${local}`;
+    return `${reduced}@s.whatsapp.net`;
+  }
+  return null;
+}
