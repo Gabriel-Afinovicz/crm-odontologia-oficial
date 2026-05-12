@@ -10,6 +10,8 @@ interface InstanceRow {
   status: "disconnected" | "connecting" | "connected";
   phone_number: string | null;
   connected_at: string | null;
+  // Exposto ao client para que a UI de cooldown sobreviva a F5 / aba nova.
+  last_manual_sync_at: string | null;
 }
 
 export async function GET(req: NextRequest) {
@@ -39,7 +41,9 @@ export async function GET(req: NextRequest) {
 
   const { data: row } = await supabase
     .from("whatsapp_instances")
-    .select("id, company_id, instance_name, status, phone_number, connected_at")
+    .select(
+      "id, company_id, instance_name, status, phone_number, connected_at, last_manual_sync_at"
+    )
     .eq("company_id", companyRow.id)
     .maybeSingle();
   const instance = row as InstanceRow | null;

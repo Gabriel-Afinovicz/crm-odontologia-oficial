@@ -2,7 +2,13 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { requireAdminForDomain } from "@/lib/supabase/require-admin-for-domain";
 import { evolution } from "@/lib/evolution/client";
-import { jidToPhone, siblingJid } from "@/lib/evolution/phone";
+import {
+  canonicalRemoteJid,
+  isIndividualJid,
+  jidToPhone,
+  siblingJid,
+} from "@/lib/evolution/phone";
+import { CHAT_VISIBILITY_DAYS } from "@/lib/whatsapp/constants";
 
 interface SyncPayload {
   domain?: string;
@@ -11,13 +17,21 @@ interface SyncPayload {
 interface InstanceRow {
   id: string;
   instance_name: string;
+  last_manual_sync_at: string | null;
 }
+
+// Cooldown server-side. Sobrevive a F5/sessao nova/multi-aba (o cooldown
+// client-side em whatsapp-instance-manager.tsx e zerado a cada montagem do
+// componente). Protege as chamadas mais sensiveis a banimento — em
+// particular, whatsappNumbers em batches contra os servidores do WhatsApp.
+const MANUAL_SYNC_COOLDOWN_MS = 60_000;
 
 interface ExistingChatRow {
   id: string;
   remote_jid: string;
   name: string | null;
   profile_picture_url: string | null;
+  last_message_at: string | null;
 }
 
 const NUMBERS_BATCH_SIZE = 25;
@@ -77,7 +91,7 @@ export async function POST(req: NextRequest) {
 
   const { data: row } = await supabaseAdmin
     .from("whatsapp_instances")
-    .select("id, instance_name")
+    .select("id, instance_name, last_manual_sync_at")
     .eq("company_id", ctx.companyId)
     .maybeSingle();
 
@@ -88,6 +102,42 @@ export async function POST(req: NextRequest) {
       { status: 404 }
     );
   }
+
+  // Cooldown server-side: bloqueia se um sync anterior ocorreu ha menos de
+  // MANUAL_SYNC_COOLDOWN_MS. Retorna 429 com retryAfterMs para o client UI
+  // sincronizar o contador. Marcamos o timestamp ANTES do trabalho — assim
+  // duas chamadas paralelas (ex: dois admins clicando ao mesmo tempo) nao
+  // disparam duas rajadas; a segunda cai no cooldown imediatamente.
+  if (instance.last_manual_sync_at) {
+    const lastMs = Date.parse(instance.last_manual_sync_at);
+    if (Number.isFinite(lastMs)) {
+      const elapsed = Date.now() - lastMs;
+      if (elapsed < MANUAL_SYNC_COOLDOWN_MS) {
+        const retryAfterMs = MANUAL_SYNC_COOLDOWN_MS - elapsed;
+        return NextResponse.json(
+          {
+            error:
+              "Sincronizacao recente. Aguarde alguns segundos antes de tentar novamente.",
+            code: "COOLDOWN",
+            retryAfterMs,
+            retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+            lastManualSyncAt: instance.last_manual_sync_at,
+          },
+          {
+            status: 429,
+            headers: {
+              "Retry-After": String(Math.ceil(retryAfterMs / 1000)),
+            },
+          }
+        );
+      }
+    }
+  }
+
+  await supabaseAdmin
+    .from("whatsapp_instances")
+    .update({ last_manual_sync_at: new Date().toISOString() })
+    .eq("id", instance.id);
 
   // Resolve nome real da instancia no Evolution (case-insensitive)
   let realInstanceName = instance.instance_name;
@@ -130,11 +180,24 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const individualChats = evoChats.filter(
-    (c) =>
-      typeof c.remoteJid === "string" &&
-      (c.remoteJid.endsWith("@s.whatsapp.net") || c.remoteJid.endsWith("@c.us"))
-  );
+  // Normaliza @lid -> @s.whatsapp.net via lastMessage.key.remoteJidAlt antes
+  // de prosseguir. Isso unifica chats `@lid` com o historico ja existente em
+  // `@s.whatsapp.net`/`@c.us` (mesmo contato, JIDs diferentes apos a
+  // migracao de privacidade do WhatsApp). Chats `@lid` sem alt continuam
+  // como individuais e seguem o fluxo, mas pulam o lookup whatsappNumbers
+  // mais abaixo (o "telefone" extraido do `@lid` nao e o real).
+  const individualChats = evoChats
+    .filter((c): c is typeof c & { remoteJid: string } =>
+      typeof c.remoteJid === "string"
+    )
+    .map((c) => {
+      const altFromLast = c.lastMessage?.key?.remoteJidAlt ?? null;
+      const canonical = canonicalRemoteJid(c.remoteJid, altFromLast);
+      return canonical && canonical !== c.remoteJid
+        ? { ...c, remoteJid: canonical }
+        : c;
+    })
+    .filter((c) => isIndividualJid(c.remoteJid));
 
   if (individualChats.length === 0) {
     return NextResponse.json({
@@ -145,38 +208,67 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Enriquecer com nome salvo na agenda do dono via whatsappNumbers em lote
-  const numbersToCheck = individualChats.map((c) => jidToPhone(c.remoteJid));
-  const savedNameByJid = new Map<string, string>();
-  const batches = await chunked(numbersToCheck, NUMBERS_BATCH_SIZE);
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    try {
-      const infos = await evolution.whatsappNumbers(realInstanceName, batch);
-      for (const info of infos) {
-        if (info?.name && info.jid) {
-          savedNameByJid.set(info.jid, info.name);
-        }
-      }
-    } catch {
-      // segue mesmo se um lote falhar
-    }
-    // Pequeno delay entre batches; pula apos o ultimo para nao atrasar
-    // a resposta a toa.
-    if (i < batches.length - 1) {
-      await sleep(randInt(BATCH_DELAY_MIN_MS, BATCH_DELAY_MAX_MS));
-    }
-  }
-
-  // Buscar chats existentes (para decidir entre insert e update)
+  // Buscar chats existentes ANTES de montar numbersToCheck — usado tanto
+  // para decidir insert/update mais abaixo quanto para o filtro incremental
+  // que decide para quais JIDs vale a pena chamar whatsappNumbers.
   const { data: existingChats } = await supabaseAdmin
     .from("whatsapp_chats")
-    .select("id, remote_jid, name, profile_picture_url")
+    .select("id, remote_jid, name, profile_picture_url, last_message_at")
     .eq("company_id", ctx.companyId);
 
   const existingByJid = new Map<string, ExistingChatRow>();
   for (const c of (existingChats ?? []) as ExistingChatRow[]) {
     existingByJid.set(c.remote_jid, c);
+  }
+
+  // Sync incremental: so faz lookup whatsappNumbers para chats que VAO
+  // aparecer na lista lateral (ativos nos ultimos N dias) E ainda nao tem
+  // nome resolvido. Chats novos (sem linha no banco) sempre passam, pois
+  // precisamos do nome inicial. Considera tambem o JID irmao com nono
+  // digito BR para nao reprocessar duplicatas. JIDs `@lid` sao pulados
+  // porque o "telefone" extraido nao e o real — para esses, usamos o
+  // pushName que ja vem do findChats.
+  const cutoffMs = Date.now() - CHAT_VISIBILITY_DAYS * 24 * 60 * 60 * 1000;
+  const numbersToCheck = individualChats
+    .filter((c) => {
+      if (c.remoteJid.endsWith("@lid")) return false;
+      const sib = siblingJid(c.remoteJid);
+      const ex =
+        existingByJid.get(c.remoteJid) ??
+        (sib ? existingByJid.get(sib) : undefined);
+      if (!ex) return true; // novo: lookup obrigatorio
+      if (ex.name) return false; // ja tem nome: pula
+      if (
+        ex.last_message_at &&
+        Date.parse(ex.last_message_at) < cutoffMs
+      ) {
+        return false; // sem nome mas inativo +N dias: nao aparecera na UI
+      }
+      return true; // sem nome E ativo: vale a pena resolver
+    })
+    .map((c) => jidToPhone(c.remoteJid));
+
+  const savedNameByJid = new Map<string, string>();
+  if (numbersToCheck.length > 0) {
+    const batches = await chunked(numbersToCheck, NUMBERS_BATCH_SIZE);
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      try {
+        const infos = await evolution.whatsappNumbers(realInstanceName, batch);
+        for (const info of infos) {
+          if (info?.name && info.jid) {
+            savedNameByJid.set(info.jid, info.name);
+          }
+        }
+      } catch {
+        // segue mesmo se um lote falhar
+      }
+      // Pequeno delay entre batches; pula apos o ultimo para nao atrasar
+      // a resposta a toa.
+      if (i < batches.length - 1) {
+        await sleep(randInt(BATCH_DELAY_MIN_MS, BATCH_DELAY_MAX_MS));
+      }
+    }
   }
 
   let inserted = 0;
@@ -201,10 +293,14 @@ export async function POST(req: NextRequest) {
         ?.conversation ?? null;
     const preview = lastConv ? lastConv.slice(0, 120) : null;
 
+    const isLid = c.remoteJid.endsWith("@lid");
     const phone = jidToPhone(c.remoteJid);
     const savedName = savedNameByJid.get(c.remoteJid) ?? null;
+    // Para `@lid` o "phone" e um identificador opaco (nao e telefone real),
+    // entao nao serve como fallback de nome. pushName/name continuam sendo
+    // bons (Baileys preenche com o nome publico do remetente).
     const resolvedName =
-      savedName ?? c.pushName ?? c.name ?? phone ?? null;
+      savedName ?? c.pushName ?? c.name ?? (isLid ? null : phone) ?? null;
 
     // Tenta JID exato; se nao existir, tenta o irmao com nono digito BR para
     // nao criar duplicata da mesma conversa.

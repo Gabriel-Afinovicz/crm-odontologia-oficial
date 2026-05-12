@@ -105,6 +105,13 @@ export interface EvolutionChatItem {
   lastMessage?: {
     messageTimestamp?: number | string | null;
     message?: Record<string, unknown> | null;
+    key?: {
+      id?: string | null;
+      remoteJid?: string | null;
+      remoteJidAlt?: string | null;
+      addressingMode?: string | null;
+      fromMe?: boolean | null;
+    } | null;
   } | null;
 }
 
@@ -136,12 +143,28 @@ export interface EvolutionMessageRecord {
     remoteJid?: string | null;
     fromMe?: boolean | null;
     participant?: string | null;
+    /**
+     * JID alternativo entregue pela Evolution quando `remoteJid` esta em
+     * `@lid` (privacidade do WhatsApp). Tipicamente aponta para o
+     * `@s.whatsapp.net`/`@c.us` real do contato. Usar via
+     * `canonicalRemoteJid` para manter o historico unificado.
+     */
+    remoteJidAlt?: string | null;
+    addressingMode?: string | null;
   };
   pushName?: string | null;
   message?: Record<string, unknown> | null;
   messageType?: string | null;
   messageTimestamp?: number | string | null;
   status?: string | null;
+  /**
+   * `contextInfo` top-level que a Evolution coloca FORA de `message` quando
+   * a mensagem e tipo `conversation` (texto curto). Para mensagens com
+   * reply em `conversation`, o `stanzaId` / `quotedMessage` ficam aqui em
+   * vez de dentro de `message.extendedTextMessage.contextInfo`. Use-o como
+   * argumento extra ao chamar `extractQuoted`.
+   */
+  contextInfo?: Record<string, unknown> | null;
 }
 
 function webhookUrlFor(instanceName: string): string | undefined {
@@ -261,6 +284,40 @@ export const evolution = {
   },
 
   /**
+   * Envia uma reacao (emoji) a uma mensagem existente. Evolution v2 endpoint:
+   * `POST /message/sendReaction/{instance}` com `{ key, reaction }`.
+   *
+   * `reaction` vazia ("") remove a reacao previa do reator nesta mensagem
+   * (mesmo comportamento do app oficial WhatsApp). O Baileys casa a reacao
+   * pela `key.id` da mensagem alvo, entao precisamos do `evolution_message_id`
+   * original armazenado na linha de `whatsapp_messages`.
+   */
+  async sendReaction(
+    instanceName: string,
+    target: {
+      evolutionMessageId: string;
+      fromMe: boolean;
+      remoteJid: string;
+    },
+    reaction: string
+  ): Promise<SendMessageResponse> {
+    return request<SendMessageResponse>(
+      `/message/sendReaction/${encodeURIComponent(instanceName)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          key: {
+            id: target.evolutionMessageId,
+            fromMe: target.fromMe,
+            remoteJid: target.remoteJid,
+          },
+          reaction,
+        }),
+      }
+    );
+  },
+
+  /**
    * Busca mensagens historicas de um chat especifico do cache local Baileys
    * da instancia (Evolution v2: POST /chat/findMessages/{instance}).
    *
@@ -337,6 +394,44 @@ export const evolution = {
     });
     if (Array.isArray(result)) return result;
     return result?.data ?? [];
+  },
+
+  /**
+   * Recupera a midia (imagem/sticker/audio/video/documento) decodificada da
+   * mensagem em base64. A `media_url` que vem nos eventos do Baileys e uma
+   * URL criptografada do WhatsApp (`mmg.whatsapp.net/...`) que precisa de
+   * `mediaKey` + decrypt para virar arquivo utilizavel; este endpoint da
+   * Evolution faz isso no servidor dela e devolve o conteudo pronto.
+   *
+   * Operacao de LEITURA do cache local Baileys da Evolution: nao gera
+   * trafego para servidores Meta/WhatsApp, portanto nao tem risco de
+   * banimento associado (mesmo perfil de `findMessages`/`findChats`).
+   */
+  async getBase64FromMediaMessage(
+    instanceName: string,
+    evolutionMessageId: string,
+    options?: { convertToMp4?: boolean }
+  ): Promise<{
+    base64?: string;
+    mimetype?: string | null;
+    fileName?: string | null;
+    mediaType?: string | null;
+  }> {
+    return request<{
+      base64?: string;
+      mimetype?: string | null;
+      fileName?: string | null;
+      mediaType?: string | null;
+    }>(
+      `/chat/getBase64FromMediaMessage/${encodeURIComponent(instanceName)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          message: { key: { id: evolutionMessageId } },
+          convertToMp4: Boolean(options?.convertToMp4),
+        }),
+      }
+    );
   },
 
   async fetchProfilePictureUrl(

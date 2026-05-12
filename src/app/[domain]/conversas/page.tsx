@@ -58,7 +58,10 @@ export default async function ConversasPage({
 
   const PAGE_SIZE = 30;
 
-  // Busca uma extra para detectar se ha mais paginas sem fazer count
+  // Busca uma extra para detectar se ha mais paginas sem fazer count.
+  // Sem filtro de janela: lista todos os chats ordenados por
+  // last_message_at desc; paginacao por blocos de PAGE_SIZE controlada
+  // no cliente via loadMore.
   const { data: chatsData } = await supabase
     .from("whatsapp_chats")
     .select("*")

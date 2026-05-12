@@ -17,6 +17,11 @@ export const metadata: Metadata = {
   description: "Sistema de gestão de leads para clínicas odontológicas",
 };
 
+// `suppressHydrationWarning` no <body> evita warnings de hidratacao causados
+// por extensoes de browser que injetam atributos antes do React hidratar
+// (ex.: ColorZilla insere `cz-shortcut-listen`; Grammarly insere
+// `data-gr-ext-installed`; etc). O escopo da flag e apenas ATRIBUTOS deste
+// elemento — desvios reais em filhos continuam sendo reportados.
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -27,7 +32,12 @@ export default function RootLayout({
       lang="pt-BR"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full bg-gray-50 font-sans">{children}</body>
+      <body
+        className="min-h-full bg-gray-50 font-sans"
+        suppressHydrationWarning
+      >
+        {children}
+      </body>
     </html>
   );
 }

@@ -374,6 +374,14 @@ export interface WhatsAppInstance {
   phone_number: string | null;
   evolution_token: string | null;
   connected_at: string | null;
+  // Timestamp do ultimo sync automatico disparado apos login. Cooldown
+  // server-side evita rajadas a Evolution quando varios operadores logam
+  // ao mesmo tempo ou recarregam o app.
+  last_post_login_sync_at: string | null;
+  // Timestamp do ultimo sync manual (botao Sincronizar em Settings).
+  // Cooldown server-side de 60s sobrevive a F5/sessao nova/multi-aba e
+  // protege as chamadas mais sensiveis (whatsappNumbers em batches).
+  last_manual_sync_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -412,6 +420,29 @@ export type WhatsAppMessageStatus =
   | "read"
   | "failed";
 
+// Reacao ao estilo WhatsApp: cada reator pode ter no maximo UMA reacao ativa
+// por mensagem (ao reagir de novo, substitui a anterior; ao enviar string
+// vazia, remove). Guardamos um array porque em chat individual podem coexistir
+// reacao do operador e reacao do contato na mesma mensagem.
+//
+// - `emoji`: emoji escolhido (string vazia significa remocao e nao deve ser
+//   persistida — `mergeReactions` filtra).
+// - `from_me`: true quando a reacao foi feita pela clinica (via CRM ou
+//   celular do operador); false quando foi o contato. Conta como heuristica
+//   de cor/posicao na bolha.
+// - `reactor_jid`: JID de quem reagiu (quando disponivel pelo Baileys). Em
+//   chat individual e quase sempre `remoteJid` do chat (para `from_me=false`)
+//   ou o JID da nossa instancia. Em chats `@lid` pode vir o `@lid` ou o
+//   `remoteJidAlt` real. Usado para `mergeReactions` decidir override.
+// - `ts`: timestamp ISO de quando a reacao foi observada — desempata reacoes
+//   atualizadas em rajada (cliente envia, webhook chega depois).
+export interface WhatsAppMessageReaction {
+  emoji: string;
+  from_me: boolean;
+  reactor_jid: string | null;
+  ts: string;
+}
+
 export interface WhatsAppMessage {
   id: string;
   company_id: string;
@@ -436,6 +467,10 @@ export interface WhatsAppMessage {
   quoted_evolution_message_id: string | null;
   quoted_body: string | null;
   quoted_from_me: boolean | null;
+  // Reacoes acumuladas. Webhook (entrada) e a rota /react (saida) usam
+  // `mergeReactions` para manter no maximo 1 emoji por reator. UI agrega
+  // por emoji para mostrar badges abaixo da bolha.
+  reactions: WhatsAppMessageReaction[];
   created_at: string;
 }
 
@@ -619,12 +654,25 @@ export interface Database {
         Row: WhatsAppInstance;
         Insert: Omit<
           WhatsAppInstance,
-          "id" | "created_at" | "updated_at" | "status" | "phone_number" | "evolution_token" | "connected_at"
+          | "id"
+          | "created_at"
+          | "updated_at"
+          | "status"
+          | "phone_number"
+          | "evolution_token"
+          | "connected_at"
+          | "last_post_login_sync_at"
+          | "last_manual_sync_at"
         > &
           Partial<
             Pick<
               WhatsAppInstance,
-              "status" | "phone_number" | "evolution_token" | "connected_at"
+              | "status"
+              | "phone_number"
+              | "evolution_token"
+              | "connected_at"
+              | "last_post_login_sync_at"
+              | "last_manual_sync_at"
             >
           >;
         Update: Partial<Omit<WhatsAppInstance, "id" | "created_at">>;

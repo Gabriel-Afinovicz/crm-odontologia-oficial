@@ -1,10 +1,19 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { jidToPhone, siblingJid } from "@/lib/evolution/phone";
+import {
+  canonicalRemoteJid,
+  isIndividualJid,
+  jidToPhone,
+  siblingJid,
+} from "@/lib/evolution/phone";
 import type {
   WhatsAppMessageMediaType,
   WhatsAppMessageStatus,
 } from "@/lib/types/database";
+import {
+  mergeReactions,
+  normalizeReactions,
+} from "@/lib/whatsapp/reactions";
 
 interface RouteParams {
   params: Promise<{ instance: string }>;
@@ -22,6 +31,14 @@ interface WebhookData {
     id?: string;
     remoteJid?: string;
     fromMe?: boolean;
+    /**
+     * JID alternativo entregue pela Evolution quando `remoteJid` esta em
+     * `@lid` (privacidade do WhatsApp). Tipicamente o `@s.whatsapp.net`
+     * real do contato — preferimos ele como `remote_jid` canonico do chat
+     * para manter o historico unificado com o que o CRM ja guardava.
+     */
+    remoteJidAlt?: string;
+    addressingMode?: string;
   };
   pushName?: string;
   message?: Record<string, unknown>;
@@ -34,6 +51,13 @@ interface WebhookData {
   id?: string;
   contact?: { name?: string };
   profilePicUrl?: string;
+  /**
+   * `contextInfo` top-level (fora de `message`) usado pelas mensagens do
+   * tipo `conversation` (texto curto) para carregar dados do reply
+   * (`stanzaId`, `quotedMessage`, `participant`). Repassado ao
+   * `extractQuoted` como fonte alternativa.
+   */
+  contextInfo?: Record<string, unknown>;
 }
 
 function normalizeEvent(raw: string | undefined): string {
@@ -54,22 +78,69 @@ interface ExtractedQuote {
   fromMe: boolean | null;
 }
 
-// Extrai a citacao (reply) de uma mensagem Baileys/Evolution. O contextInfo
-// pode aparecer em qualquer um dos sub-objetos de mensagem (texto/imagem/
-// audio/video/documento), entao precisamos olhar todos. O Baileys identifica
-// a mensagem citada por `stanzaId` e replica o conteudo em `quotedMessage`.
-// Para chats individuais (que sao todos os que tratamos), o `participant`
-// vem como o JID do autor da mensagem citada, e podemos compara-lo com o
-// remoteJid do chat: igual = era do contato; diferente = era nossa.
+// Constroi a citacao a partir de um `contextInfo` ja localizado.
+// Compartilhada entre os dois caminhos: `contextInfo` top-level (mensagens
+// `conversation`) e `contextInfo` dentro de sub-objeto (`extendedTextMessage`,
+// `imageMessage`, etc).
+function buildQuoteFromContext(
+  ctx: Record<string, unknown>,
+  remoteJid: string | null | undefined
+): ExtractedQuote | null {
+  const stanzaId =
+    typeof ctx["stanzaId"] === "string" ? (ctx["stanzaId"] as string) : null;
+  if (!stanzaId) return null;
+  const quotedMsg = ctx["quotedMessage"] as
+    | Record<string, unknown>
+    | undefined;
+  const quotedExtract = extractMessage(quotedMsg);
+  const participant =
+    typeof ctx["participant"] === "string"
+      ? (ctx["participant"] as string)
+      : null;
+  let fromMe: boolean | null = null;
+  if (participant && remoteJid) {
+    fromMe = participant !== remoteJid;
+  }
+  return {
+    evolutionMessageId: stanzaId,
+    body:
+      quotedExtract.body && quotedExtract.body.trim().length > 0
+        ? quotedExtract.body.slice(0, 240)
+        : quotedExtract.mediaType !== "text" &&
+            quotedExtract.mediaType !== "unknown"
+          ? `[${quotedExtract.mediaType}]`
+          : null,
+    fromMe,
+  };
+}
+
+// Extrai a citacao (reply) de uma mensagem Baileys/Evolution. O `contextInfo`
+// pode aparecer em dois lugares dependendo do tipo da mensagem:
+//   1) Top-level no record (`record.contextInfo`) para `messageType:
+//      "conversation"` (texto curto). E o caso comum hoje, sobretudo apos
+//      a migracao do WhatsApp para chats `@lid`.
+//   2) Dentro de cada sub-objeto de `message` (`extendedTextMessage`,
+//      `imageMessage`, `videoMessage`, etc) — formato classico, ainda usado
+//      para midia e textos longos.
+//
+// O Baileys identifica a mensagem citada por `stanzaId` e replica o conteudo
+// em `quotedMessage`. Para chats individuais, `participant` traz o JID do
+// autor original da mensagem citada — comparando com o `remoteJid` (canonico)
+// do chat sabemos se era nossa (out) ou do contato (in).
 function extractQuoted(
   message: Record<string, unknown> | undefined | null,
-  remoteJid: string | null | undefined
+  remoteJid: string | null | undefined,
+  topLevelContextInfo?: Record<string, unknown> | null
 ): ExtractedQuote {
   const empty: ExtractedQuote = {
     evolutionMessageId: null,
     body: null,
     fromMe: null,
   };
+  if (topLevelContextInfo) {
+    const built = buildQuoteFromContext(topLevelContextInfo, remoteJid);
+    if (built) return built;
+  }
   if (!message) return empty;
   const candidates = [
     "extendedTextMessage",
@@ -85,36 +156,72 @@ function extractQuoted(
       | undefined;
     const ctx = sub?.contextInfo;
     if (!ctx) continue;
-    const stanzaId =
-      typeof ctx["stanzaId"] === "string"
-        ? (ctx["stanzaId"] as string)
-        : null;
-    if (!stanzaId) continue;
-    const quotedMsg = ctx["quotedMessage"] as
-      | Record<string, unknown>
-      | undefined;
-    const quotedExtract = extractMessage(quotedMsg);
-    const participant =
-      typeof ctx["participant"] === "string"
-        ? (ctx["participant"] as string)
-        : null;
-    let fromMe: boolean | null = null;
-    if (participant && remoteJid) {
-      fromMe = participant !== remoteJid;
-    }
-    return {
-      evolutionMessageId: stanzaId,
-      body:
-        quotedExtract.body && quotedExtract.body.trim().length > 0
-          ? quotedExtract.body.slice(0, 240)
-          : quotedExtract.mediaType !== "text" &&
-              quotedExtract.mediaType !== "unknown"
-            ? `[${quotedExtract.mediaType}]`
-            : null,
-      fromMe,
-    };
+    const built = buildQuoteFromContext(ctx, remoteJid);
+    if (built) return built;
   }
   return empty;
+}
+
+interface ExtractedReaction {
+  targetEvolutionMessageId: string;
+  targetFromMe: boolean | null;
+  emoji: string;
+  ts: string;
+  reactorJid: string | null;
+}
+
+// Detecta `message.reactionMessage` no payload Baileys/Evolution. Estrutura:
+//   { reactionMessage: {
+//       key: { id, fromMe, remoteJid, participant? },
+//       text: "<emoji>" | "",         // string vazia = remocao
+//       senderTimestampMs: <ms> | string
+//     } }
+// Retorna `null` quando a mensagem nao e uma reacao — chamadores caem para
+// o fluxo normal de inserir mensagem.
+function extractReaction(
+  message: Record<string, unknown> | undefined | null,
+  outerReactorJid: string | null
+): ExtractedReaction | null {
+  if (!message) return null;
+  const reaction = message["reactionMessage"] as
+    | {
+        key?: {
+          id?: string | null;
+          fromMe?: boolean | null;
+          remoteJid?: string | null;
+          participant?: string | null;
+        } | null;
+        text?: string | null;
+        senderTimestampMs?: number | string | null;
+      }
+    | undefined;
+  if (!reaction || typeof reaction !== "object") return null;
+  const targetId =
+    typeof reaction.key?.id === "string" ? reaction.key.id : null;
+  if (!targetId) return null;
+  const targetFromMe =
+    typeof reaction.key?.fromMe === "boolean" ? reaction.key.fromMe : null;
+  const emoji =
+    typeof reaction.text === "string" ? reaction.text : "";
+  // Baileys envia o `senderTimestampMs` ja em ms (alguns servers em segundos
+  // como string). Best-effort: se nao parseia, cai pra now().
+  let ts = new Date().toISOString();
+  const rawTs = reaction.senderTimestampMs;
+  if (rawTs != null) {
+    const num = typeof rawTs === "number" ? rawTs : Number(rawTs);
+    if (Number.isFinite(num) && num > 0) {
+      // Heuristica: ms se > 10^12, segundos caso contrario.
+      const ms = num > 1e12 ? num : num * 1000;
+      ts = new Date(ms).toISOString();
+    }
+  }
+  return {
+    targetEvolutionMessageId: targetId,
+    targetFromMe,
+    emoji,
+    ts,
+    reactorJid: outerReactorJid,
+  };
 }
 
 function extractMessage(message: Record<string, unknown> | undefined): ExtractedMessage {
@@ -282,14 +389,19 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   }
 
   if ((event.startsWith("messages.upsert") || event.startsWith("messages.update")) && data?.key) {
-    const remoteJid = data.key.remoteJid;
+    const rawRemoteJid = data.key.remoteJid;
     const evoMsgId = data.key.id ?? null;
     const fromMe = Boolean(data.key.fromMe);
-    if (!remoteJid) {
+    if (!rawRemoteJid) {
       return NextResponse.json({ ok: true });
     }
-    if (!remoteJid.endsWith("@s.whatsapp.net") && !remoteJid.endsWith("@c.us")) {
-      // ignora grupos por ora
+    // Normaliza @lid -> @s.whatsapp.net via remoteJidAlt quando a Evolution
+    // entrega. Mantem o historico unificado com o que ja existia em
+    // `whatsapp_chats.remote_jid`. Sem alt, mantemos o proprio @lid.
+    const remoteJid =
+      canonicalRemoteJid(rawRemoteJid, data.key.remoteJidAlt) ?? rawRemoteJid;
+    if (!isIndividualJid(remoteJid)) {
+      // ignora grupos (`@g.us`) e outros formatos nao-individuais
       return NextResponse.json({ ok: true, ignored: "non-individual" });
     }
 
@@ -355,8 +467,44 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     }
 
     // messages.upsert
+
+    // === Reacao (reactionMessage) ===
+    // Reactions chegam como uma "mensagem" no payload do Evolution mas nao
+    // devem virar uma linha nova em whatsapp_messages — viram update do array
+    // `reactions` da mensagem alvo. Sem este tratamento, o webhook caia no
+    // fluxo generico e gravava uma bolha vazia `[unknown]` no chat.
+    const reaction = extractReaction(data.message, remoteJid);
+    if (reaction) {
+      const { data: targetMsg } = await supabaseAdmin
+        .from("whatsapp_messages")
+        .select("id, reactions")
+        .eq("company_id", instanceRow.company_id)
+        .eq("evolution_message_id", reaction.targetEvolutionMessageId)
+        .maybeSingle();
+      const targetRow =
+        (targetMsg as { id: string; reactions: unknown } | null) ?? null;
+      if (!targetRow) {
+        // Mensagem original ainda nao foi gravada no banco — pode acontecer
+        // se a reacao chegar antes da mensagem (race) ou se a mensagem e
+        // muito antiga e nunca foi sincronizada. Best-effort: ignora.
+        return NextResponse.json({ ok: true, ignored: "reaction_target_missing" });
+      }
+      const current = normalizeReactions(targetRow.reactions);
+      const merged = mergeReactions(current, {
+        emoji: reaction.emoji,
+        from_me: fromMe,
+        reactor_jid: reaction.reactorJid,
+        ts: reaction.ts,
+      });
+      await supabaseAdmin
+        .from("whatsapp_messages")
+        .update({ reactions: merged })
+        .eq("id", targetRow.id);
+      return NextResponse.json({ ok: true, reaction: true });
+    }
+
     const extracted = extractMessage(data.message);
-    const quoted = extractQuoted(data.message, remoteJid);
+    const quoted = extractQuoted(data.message, remoteJid, data.contextInfo);
     const ts = data.messageTimestamp;
     const tsIso =
       typeof ts === "number"
@@ -364,6 +512,16 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         : typeof ts === "string"
           ? new Date(Number(ts) * 1000).toISOString()
           : new Date().toISOString();
+
+    // Mensagens nao mapeadas (protocolMessage, locationMessage, contactMessage,
+    // etc) caem em `unknown` + body null no extractMessage. Antes essas linhas
+    // viravam bolhas '[unknown]' inuteis no chat. Como nenhuma carrega texto
+    // que o operador possa ler, ignoramos: nao gravamos, nao atualizamos
+    // last_message_at, nao incrementamos unread. Reactions ja foram tratadas
+    // acima; chegamos aqui apenas para tipos sem renderizacao util.
+    if (extracted.mediaType === "unknown" && !extracted.body) {
+      return NextResponse.json({ ok: true, ignored: "unsupported_message_type" });
+    }
 
     // Idempotencia: se ja existe mensagem com este evolution_message_id, ignora
     if (evoMsgId) {
@@ -440,8 +598,16 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   }
 
   if (event.startsWith("chats.upsert") && data) {
-    const remoteJid = data.remoteJid ?? data.key?.remoteJid;
-    if (!remoteJid) return NextResponse.json({ ok: true });
+    const rawRemoteJid = data.remoteJid ?? data.key?.remoteJid;
+    if (!rawRemoteJid) return NextResponse.json({ ok: true });
+    // Mesma normalizacao @lid -> @s.whatsapp.net usada nas mensagens; sem
+    // isso, atualizacoes de nome/foto de contatos `@lid` nao chegariam ao
+    // chat unificado armazenado pelo `@s.whatsapp.net` real.
+    const remoteJid =
+      canonicalRemoteJid(rawRemoteJid, data.key?.remoteJidAlt) ?? rawRemoteJid;
+    if (!isIndividualJid(remoteJid)) {
+      return NextResponse.json({ ok: true, ignored: "non-individual" });
+    }
     const name = data.contact?.name ?? data.pushName ?? null;
     if (name || data.profilePicUrl) {
       await supabaseAdmin

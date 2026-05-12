@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -16,7 +17,13 @@ import type {
   WhatsAppChat,
   WhatsAppInstance,
   WhatsAppMessage,
+  WhatsAppMessageReaction,
 } from "@/lib/types/database";
+import {
+  QUICK_REACTION_EMOJIS,
+  mergeReactions,
+  normalizeReactions,
+} from "@/lib/whatsapp/reactions";
 
 interface ConversasContentProps {
   domain: string;
@@ -113,6 +120,13 @@ function sortMessagesAsc(list: WhatsAppMessage[]): WhatsAppMessage[] {
   return [...list].sort(compareMessagesAsc);
 }
 
+// Quantidade inicial de mensagens carregadas ao abrir um chat. Mensagens
+// mais antigas ficam "atras" do botao "Carregar mensagens anteriores" no
+// topo do painel — o operador puxa por demanda em vez de pagar o render
+// de centenas de bolhas de uma vez. 30 cobre o contexto recente da maioria
+// das conversas sem causar flash visual ao alinhar o scroll no fim.
+const MESSAGES_PAGE_SIZE = 30;
+
 // Jitter aleatorio aplicado entre envios em rajada para simular digitacao
 // humana e reduzir o risco do WhatsApp marcar o numero como bot. Mensagem
 // isolada (fila vazia no momento do clique) nao paga o custo deste delay.
@@ -165,9 +179,21 @@ export function ConversasContent({
     initialChatId ?? initialChats[0]?.id ?? null
   );
   const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
+  // Paginacao de mensagens: carrega MESSAGES_PAGE_SIZE inicialmente; o
+  // operador clica em "Carregar mensagens anteriores" no topo para puxar
+  // a proxima pagina (ordenada por created_at DESC, mais antiga em seguida).
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [usersById, setUsersById] = useState<Map<string, string>>(new Map());
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [search, setSearch] = useState("");
+  // Resultados da busca server-side. null = sem busca ativa (renderiza
+  // `chats` filtrado pela janela de 30 dias). Array = renderiza ESSE array
+  // (sem filtro de janela; permite achar contato antigo).
+  const [searchResults, setSearchResults] = useState<WhatsAppChat[] | null>(
+    null
+  );
+  const [searching, setSearching] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -198,8 +224,15 @@ export function ConversasContent({
     string | null
   >(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Modal de visualizacao em tela cheia. `null` = fechado; objeto contem
+  // o tipo de midia (imagem ou documento) e o id da mensagem que originou
+  // a abertura — controla qual lightbox renderizar.
+  const [lightbox, setLightbox] = useState<
+    | { kind: "image"; messageId: string }
+    | { kind: "document"; messageId: string }
+    | null
+  >(null);
 
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const incomingToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
@@ -209,19 +242,31 @@ export function ConversasContent({
   // Heuristica de "perto do fim" (default true para a primeira renderizacao).
   // Atualizado a cada onScroll do container.
   const isNearBottomRef = useRef(true);
+  // Snapshot do scrollHeight ANTES de carregar mensagens antigas, usado
+  // pelo useLayoutEffect para preservar a posicao visual do operador apos
+  // prepend (so cresce o conteudo "para cima"). Sem isso o usuario seria
+  // "puxado" para o topo do novo bloco.
+  const scrollHeightBeforeRef = useRef(0);
+  // Sinaliza ao useLayoutEffect[messages] que a proxima atualizacao deve
+  // restaurar a posicao em vez de descer ao fim. Limpado no proprio effect.
+  const justLoadedOlderRef = useRef(false);
   // Refs para acessar valores atuais dentro de callbacks de realtime
   const hasMoreRef = useRef(hasMore);
   const chatsRef = useRef(chats);
   const activeChatIdRef = useRef(activeChatId);
   // Mapa chatId -> timestamp do ultimo fetch a Evolution. Em ambientes onde
   // o webhook nao consegue alcancar o servidor (ex: localhost), este loop
-  // funciona como fallback: a cada 30s o chat ATIVO pede as ultimas 10
-  // mensagens a Evolution. Como /load-history e idempotente
-  // (constraint company_id, evolution_message_id), repetir nao duplica.
+  // funciona como fallback: a cada poll o chat ATIVO pede as ultimas 10
+  // mensagens a Evolution. Como /load-history e idempotente (constraint
+  // company_id, evolution_message_id), repetir nao duplica.
   const lastEvolutionFetchRef = useRef<Map<string, number>>(new Map());
   // Intervalo entre fetches automaticos a Evolution para o chat ativo.
-  // 30s e um meio-termo entre frescor da conversa e nao virar rajada.
-  const EVOLUTION_POLL_INTERVAL_MS = 30_000;
+  // 15s e um meio-termo entre frescor da conversa (sensacao de "instantaneo"
+  // quando webhook nao chega) e nao virar rajada para o numero. Reduzido de
+  // 30s -> 15s porque com webhook caindo (ex: tunnel cloudflared instavel),
+  // o tempo de aparicao da mensagem no chat ativo era percebido como lento
+  // demais pelo operador.
+  const EVOLUTION_POLL_INTERVAL_MS = 15_000;
   // Fila de envio: cada nova mensagem aguarda a anterior terminar para
   // garantir que cheguem ao WhatsApp na mesma ordem em que foram enviadas
   // pelo usuario, mesmo se varias forem disparadas em rapida sucessao.
@@ -250,15 +295,52 @@ export function ConversasContent({
   );
 
   const filteredChats = useMemo(() => {
-    if (!search.trim()) return chats;
-    const q = search.trim().toLowerCase();
-    return chats.filter((c) => {
-      const phone = c.remote_jid.toLowerCase();
-      const name = (c.name ?? "").toLowerCase();
-      const preview = (c.last_message_preview ?? "").toLowerCase();
-      return phone.includes(q) || name.includes(q) || preview.includes(q);
-    });
-  }, [chats, search]);
+    if (searchResults !== null) return searchResults;
+    return chats;
+  }, [chats, searchResults]);
+
+  // Busca server-side com debounce de 250ms. Quando o operador digita
+  // >= 2 caracteres consultamos o Supabase ignorando o filtro de janela
+  // de 30 dias — o objetivo aqui e localizar contatos antigos pelo nome
+  // ou telefone. Caracteres que conflitam com a sintaxe do filtro `.or()`
+  // do PostgREST (virgulas, parenteses, `*`) sao removidos antes da query.
+  useEffect(() => {
+    const q = search.trim();
+    if (q.length < 2) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const sanitized = q.replace(/[,()*%]/g, "").slice(0, 80);
+    if (!sanitized) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+    const handle = setTimeout(async () => {
+      const supabase = createClient();
+      const like = `%${sanitized}%`;
+      const { data } = await supabase
+        .from("whatsapp_chats")
+        .select("*")
+        .eq("company_id", companyId)
+        .eq("is_archived", false)
+        .or(
+          `name.ilike.${like},remote_jid.ilike.${like},last_message_preview.ilike.${like}`
+        )
+        .order("last_message_at", { ascending: false, nullsFirst: false })
+        .limit(50);
+      // Se a busca foi limpa/atualizada enquanto a query corria, o effect
+      // ja foi limpo via cleanup (clearTimeout). Setar mesmo assim e ok:
+      // o proximo run sobrescreve.
+      setSearchResults((data as WhatsAppChat[] | null) ?? []);
+      setSearching(false);
+    }, 250);
+    return () => {
+      clearTimeout(handle);
+    };
+  }, [search, companyId]);
 
   // Defesa final: sempre renderiza mensagens deduplicadas por id e ordenadas
   // pelo timestamp real do evento (received_at/sent_at), nao por created_at.
@@ -276,33 +358,47 @@ export function ConversasContent({
       if (!activeChatId) {
         if (!cancelled) {
           setMessages([]);
+          setHasOlderMessages(false);
+          setLoadingOlderMessages(false);
           setLoadingMessages(false);
         }
         return;
       }
-      if (!cancelled) setLoadingMessages(true);
+      if (!cancelled) {
+        setLoadingMessages(true);
+        // Reseta paginacao ao trocar de chat: o botao "carregar anteriores"
+        // so deve aparecer apos a primeira pagina ser avaliada.
+        setHasOlderMessages(false);
+        setLoadingOlderMessages(false);
+      }
       const supabase = createClient();
+      // Carga inicial em DESC para pegar as MESSAGES_PAGE_SIZE mais
+      // recentes (PAGE_SIZE + 1 detecta se ha pagina anterior). Depois
+      // .reverse() para exibir cronologicamente (mais antiga em cima).
       const { data } = await supabase
         .from("whatsapp_messages")
         .select("*")
         .eq("chat_id", activeChatId)
-        .order("created_at", { ascending: true })
-        .limit(500);
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_SIZE + 1);
       if (cancelled) return;
-      const fresh = (data as WhatsAppMessage[] | null) ?? [];
+      const fetched = (data as WhatsAppMessage[] | null) ?? [];
+      const more = fetched.length > MESSAGES_PAGE_SIZE;
+      const page = (more ? fetched.slice(0, MESSAGES_PAGE_SIZE) : fetched).slice().reverse();
 
       // Mostra imediatamente o que ja temos em cache local (banco) para nao
       // bloquear a UI enquanto pedimos historico fresco a Evolution.
-      setMessages(dedupeById(fresh));
+      setHasOlderMessages(more);
+      setMessages(dedupeById(page));
       setLoadingMessages(false);
 
-      // Sempre puxa as ultimas 50 mensagens da Evolution na primeira
-      // abertura desta conversa nesta sessao — assim o operador entra com
-      // contexto suficiente para uma conversa fluida, mesmo que o webhook
-      // ainda nao tenha entregue tudo. O endpoint /load-history e idempotente
+      // Sempre puxa as ultimas mensagens da Evolution na primeira abertura
+      // desta conversa nesta sessao — assim o operador entra com contexto
+      // suficiente para uma conversa fluida, mesmo que o webhook ainda nao
+      // tenha entregue tudo. O endpoint /load-history e idempotente
       // (filtra por (company_id, evolution_message_id)), entao nao duplica
       // mensagens ja gravadas. Atualizacoes subsequentes ficam por conta do
-      // loop de polling automatico (a cada 30s) ou do botao manual.
+      // loop de polling automatico ou do botao manual.
       const lastFetch = lastEvolutionFetchRef.current.get(activeChatId) ?? 0;
       if (Date.now() - lastFetch > EVOLUTION_POLL_INTERVAL_MS) {
         lastEvolutionFetchRef.current.set(activeChatId, Date.now());
@@ -310,18 +406,32 @@ export function ConversasContent({
           const res = await fetch("/api/whatsapp/messages/load-history", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chatId: activeChatId, limit: 50 }),
+            body: JSON.stringify({
+              chatId: activeChatId,
+              limit: MESSAGES_PAGE_SIZE,
+            }),
           });
           if (res.ok) {
+            // Re-select segue o mesmo padrao DESC + reverse para alinhar
+            // com a paginacao: nao expandimos a janela visivel sozinhos,
+            // so atualizamos o que ja esta carregado com novidades fresh.
             const { data: refreshed } = await supabase
               .from("whatsapp_messages")
               .select("*")
               .eq("chat_id", activeChatId)
-              .order("created_at", { ascending: true })
-              .limit(500);
+              .order("created_at", { ascending: false })
+              .limit(MESSAGES_PAGE_SIZE + 1);
             if (cancelled) return;
-            const list = (refreshed as WhatsAppMessage[] | null) ?? [];
-            setMessages(dedupeById(list));
+            const refreshedList = (refreshed as WhatsAppMessage[] | null) ?? [];
+            const moreAfter = refreshedList.length > MESSAGES_PAGE_SIZE;
+            const pageAfter = (moreAfter
+              ? refreshedList.slice(0, MESSAGES_PAGE_SIZE)
+              : refreshedList
+            )
+              .slice()
+              .reverse();
+            setHasOlderMessages(moreAfter);
+            setMessages(dedupeById(pageAfter));
           }
         } catch {
           // Silencioso: se a Evolution nao tiver historico ou a chamada falhar,
@@ -354,23 +464,35 @@ export function ConversasContent({
     })();
   }, [activeChatId, chats]);
 
-  // Auto-scroll inteligente: SO desce automaticamente se o usuario ja estava
-  // perto do fim. Isso preserva a posicao de leitura quando o operador esta
-  // rolando o historico para cima e o polling/realtime entrega novas mensagens.
-  useEffect(() => {
-    if (!isNearBottomRef.current) return;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  // Auto-scroll executado ANTES do paint (useLayoutEffect) — elimina o
+  // "flash" visual de ver o topo da lista por um frame antes do scroll.
+  // Tres comportamentos:
+  //   1) Acabou de carregar mensagens antigas (prepend): preserva a posicao
+  //      visual somando a diferenca de altura ao scrollTop.
+  //   2) Usuario perto do fim: desce automaticamente para a nova mensagem.
+  //   3) Usuario rolou para cima lendo historico: nao mexe no scroll.
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (justLoadedOlderRef.current) {
+      const newH = el.scrollHeight;
+      el.scrollTop += newH - scrollHeightBeforeRef.current;
+      justLoadedOlderRef.current = false;
+      return;
+    }
+    if (isNearBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [messages]);
 
-  // Trocar de conversa SEMPRE leva ao fim (comportamento esperado: abrir o
-  // chat ja mostrando a mensagem mais recente).
-  useEffect(() => {
+  // Trocar de conversa SEMPRE leva ao fim. useLayoutEffect roda antes do
+  // paint do novo chat — sem requestAnimationFrame, sem flash visual.
+  useLayoutEffect(() => {
     if (!activeChatId) return;
+    const el = scrollContainerRef.current;
+    if (!el) return;
     isNearBottomRef.current = true;
-    // 'auto' sem animacao para nao parecer um scroll automatico estranho.
-    requestAnimationFrame(() => {
-      messagesEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-    });
+    el.scrollTop = el.scrollHeight;
   }, [activeChatId]);
 
   // Mede a distancia ate o fim para decidir se um proximo update deve dar
@@ -499,10 +621,11 @@ export function ConversasContent({
   }, [companyId]);
 
   // Polling de seguranca: a cada 10s sincroniza o que esta no banco (lista
-  // de chats e mensagens do chat ativo) e, em paralelo, a cada 30s pede a
-  // Evolution as ultimas mensagens do chat ativo. O segundo loop e o
-  // FALLBACK para ambientes onde o webhook nao consegue alcancar o servidor
-  // (ex: localhost em dev) — sem ele, mensagens recebidas nunca apareceriam.
+  // de chats e mensagens do chat ativo) e, em paralelo, a cada
+  // EVOLUTION_POLL_INTERVAL_MS pede a Evolution as ultimas mensagens do
+  // chat ativo. O segundo loop e o FALLBACK para ambientes onde o webhook
+  // nao consegue alcancar o servidor (ex: localhost em dev) — sem ele,
+  // mensagens recebidas nunca apareceriam.
   useEffect(() => {
     const supabase = createClient();
     let cancelled = false;
@@ -531,6 +654,10 @@ export function ConversasContent({
     }
 
     async function syncChatList() {
+      // Sem filtro de janela: refresca os primeiros pageSize chats por
+      // last_message_at desc. Realtime de postgres_changes cobre INSERT/
+      // UPDATE de chats fora dessa primeira pagina (sobem para o topo
+      // quando recebem atividade nova).
       const { data } = await supabase
         .from("whatsapp_chats")
         .select("*")
@@ -697,6 +824,66 @@ export function ConversasContent({
 
   function cancelReply() {
     setReplyingTo(null);
+  }
+
+  // Aplica/remove reacao do operador a uma mensagem. Atualizacao otimista:
+  // mexe no array `reactions` local imediatamente para o operador ver o
+  // emoji aparecer/sumir, e em paralelo bate na rota que chama a Evolution.
+  // Em caso de erro, restauramos o estado anterior e mostramos o erro no
+  // mesmo banner ja usado para falhas de send (sendError).
+  async function reactToMessage(messageId: string, emoji: string) {
+    if (messageId.startsWith("temp-")) return;
+    const target = messages.find((m) => m.id === messageId);
+    if (!target) return;
+    const previousReactions = normalizeReactions(target.reactions);
+    const optimistic = mergeReactions(previousReactions, {
+      emoji,
+      from_me: true,
+      reactor_jid: null,
+      ts: new Date().toISOString(),
+    });
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId ? { ...m, reactions: optimistic } : m
+      )
+    );
+    try {
+      const res = await fetch(
+        `/api/whatsapp/messages/${messageId}/react`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ emoji }),
+        }
+      );
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        setSendError(payload.error ?? "Falha ao reagir.");
+        // Rollback: restaura o array anterior; o realtime/syncActiveChat
+        // sobrescreve com o estado real no proximo tick caso o servidor
+        // tenha feito update parcial.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId
+              ? { ...m, reactions: previousReactions }
+              : m
+          )
+        );
+      }
+    } catch (err) {
+      setSendError(
+        err instanceof Error ? err.message : "Erro de rede ao reagir."
+      );
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId
+            ? { ...m, reactions: previousReactions }
+            : m
+        )
+      );
+    }
   }
 
   // Localiza a mensagem original a partir do evolution_message_id citado
@@ -876,9 +1063,11 @@ export function ConversasContent({
       .eq("id", activeChat.id);
   }
 
-  // Refresh manual: pede a Evolution as ultimas 50 mensagens do chat ativo
-  // e refaz o select local. Ignora o intervalo de polling de proposito —
-  // se o operador clicou, ele quer reapurar agora.
+  // Refresh manual: pede a Evolution as ultimas mensagens do chat ativo e
+  // refaz o select local. Ignora o intervalo de polling de proposito — se
+  // o operador clicou, ele quer reapurar agora. Usa DESC + reverse para
+  // alinhar com a paginacao (so a primeira pagina e exibida; o botao
+  // "carregar anteriores" continua valido para descer mais no historico).
   async function refreshHistory() {
     const chatId = activeChatIdRef.current;
     if (!chatId || refreshingHistory) return;
@@ -888,7 +1077,7 @@ export function ConversasContent({
       const res = await fetch("/api/whatsapp/messages/load-history", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId, limit: 50 }),
+        body: JSON.stringify({ chatId, limit: MESSAGES_PAGE_SIZE }),
       });
       if (!res.ok) {
         const payload = (await res.json().catch(() => ({}))) as { error?: string };
@@ -900,17 +1089,70 @@ export function ConversasContent({
         .from("whatsapp_messages")
         .select("*")
         .eq("chat_id", chatId)
-        .order("created_at", { ascending: true })
-        .limit(500);
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_SIZE + 1);
       // Reinicia o relogio do polling automatico para nao disparar de novo
-      // logo em seguida — ja acabamos de buscar 50 msgs.
+      // logo em seguida — ja acabamos de buscar mensagens.
       lastEvolutionFetchRef.current.set(chatId, Date.now());
-      const list = (data as WhatsAppMessage[] | null) ?? [];
-      setMessages(dedupeById(list));
+      const fetched = (data as WhatsAppMessage[] | null) ?? [];
+      const more = fetched.length > MESSAGES_PAGE_SIZE;
+      const page = (more ? fetched.slice(0, MESSAGES_PAGE_SIZE) : fetched)
+        .slice()
+        .reverse();
+      setHasOlderMessages(more);
+      setMessages(dedupeById(page));
     } catch (err) {
       setRefreshError(err instanceof Error ? err.message : "Erro de rede.");
     } finally {
       setRefreshingHistory(false);
+    }
+  }
+
+  // Pagina anterior de mensagens: usa o created_at MAIS ANTIGO no estado
+  // como cursor e busca PAGE_SIZE + 1 com created_at < cursor (DESC). O
+  // scroll e preservado pelo useLayoutEffect[messages] usando o flag
+  // justLoadedOlderRef + scrollHeightBeforeRef.
+  async function loadOlderMessages() {
+    if (loadingOlderMessages || !hasOlderMessages) return;
+    if (messages.length === 0) return;
+    const chatId = activeChatIdRef.current;
+    if (!chatId) return;
+
+    // Cursor robusto: o ARRAY pode ter sido reordenado por upserts/realtime,
+    // entao calculamos o min(created_at) explicitamente em vez de assumir
+    // messages[0]. Empate (mesmo timestamp) e improvavel mas, se ocorrer,
+    // o filtro .lt corta corretamente — duplicatas sao removidas pelo dedupe.
+    let oldestCreatedAt = messages[0].created_at;
+    for (const m of messages) {
+      if (m.created_at < oldestCreatedAt) oldestCreatedAt = m.created_at;
+    }
+
+    const el = scrollContainerRef.current;
+    scrollHeightBeforeRef.current = el?.scrollHeight ?? 0;
+
+    setLoadingOlderMessages(true);
+    try {
+      const supabase = createClient();
+      const { data } = await supabase
+        .from("whatsapp_messages")
+        .select("*")
+        .eq("chat_id", chatId)
+        .lt("created_at", oldestCreatedAt)
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_SIZE + 1);
+      const fetched = (data as WhatsAppMessage[] | null) ?? [];
+      const more = fetched.length > MESSAGES_PAGE_SIZE;
+      const page = (more ? fetched.slice(0, MESSAGES_PAGE_SIZE) : fetched)
+        .slice()
+        .reverse();
+      // Sinaliza ao layout effect: a proxima atualizacao deve preservar a
+      // posicao em vez de descer. Setamos ANTES do setMessages para evitar
+      // race com o re-render.
+      justLoadedOlderRef.current = true;
+      setHasOlderMessages(more);
+      setMessages((prev) => dedupeById([...page, ...prev]));
+    } finally {
+      setLoadingOlderMessages(false);
     }
   }
 
@@ -920,7 +1162,8 @@ export function ConversasContent({
     try {
       const supabase = createClient();
       const offset = chatsRef.current.length;
-      // Pede pageSize + 1 para detectar se ainda ha mais paginas
+      // Pede pageSize + 1 para detectar se ainda ha mais paginas. Sem
+      // filtro de janela: lista completa em blocos de pageSize.
       const { data } = await supabase
         .from("whatsapp_chats")
         .select("*")
@@ -972,7 +1215,11 @@ export function ConversasContent({
           <div className="flex-1 overflow-y-auto">
             {filteredChats.length === 0 ? (
               <div className="p-6 text-center text-xs text-gray-400">
-                Nenhuma conversa.
+                {searching
+                  ? "Buscando..."
+                  : searchResults !== null
+                    ? "Nenhum contato encontrado."
+                    : "Nenhuma conversa."}
               </div>
             ) : (
               filteredChats.map((c) => {
@@ -1051,22 +1298,28 @@ export function ConversasContent({
                 );
               })
             )}
-            {hasMore && !search.trim() && (
+            {searchResults === null && filteredChats.length > 0 && (
               <div className="border-t border-gray-100 p-3">
-                <button
-                  type="button"
-                  onClick={loadMore}
-                  disabled={loadingMore}
-                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                >
-                  {loadingMore ? "Carregando..." : "Carregar mais"}
-                </button>
+                {hasMore ? (
+                  <button
+                    type="button"
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    {loadingMore ? "Carregando..." : "Carregar mais"}
+                  </button>
+                ) : (
+                  <p className="text-center text-[11px] leading-relaxed text-gray-400">
+                    Sem mais conversas.
+                  </p>
+                )}
               </div>
             )}
           </div>
         </aside>
 
-        <section className="flex flex-1 flex-col bg-gray-50">
+        <section className="flex min-w-0 flex-1 flex-col bg-gray-50">
           {!activeChat ? (
             <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
               Selecione uma conversa para comecar
@@ -1159,7 +1412,7 @@ export function ConversasContent({
               <div
                 ref={scrollContainerRef}
                 onScroll={handleMessagesScroll}
-                className="flex-1 overflow-y-auto px-6 py-4"
+                className="min-w-0 flex-1 overflow-y-auto px-6 py-4"
               >
                 {loadingMessages ? (
                   <div className="text-center text-xs text-gray-400">
@@ -1171,6 +1424,20 @@ export function ConversasContent({
                   </div>
                 ) : (
                   <div className="flex flex-col gap-1.5">
+                    {hasOlderMessages && (
+                      <div className="flex justify-center pb-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={loadOlderMessages}
+                          disabled={loadingOlderMessages}
+                          className="rounded-full border border-gray-200 bg-white px-4 py-1.5 text-xs font-medium text-gray-600 shadow-sm hover:bg-gray-50 disabled:opacity-50"
+                        >
+                          {loadingOlderMessages
+                            ? "Carregando..."
+                            : "Carregar mensagens anteriores"}
+                        </button>
+                      </div>
+                    )}
                     {renderedMessages.map((m) => (
                       <MessageBubble
                         key={m.id}
@@ -1183,6 +1450,10 @@ export function ConversasContent({
                         )}
                         onReply={startReply}
                         onJumpToQuote={jumpToQuote}
+                        onReact={reactToMessage}
+                        onOpenMedia={(kind, id) =>
+                          setLightbox({ kind, messageId: id })
+                        }
                         highlighted={highlightedMessageId === m.id}
                         contactName={
                           activeChat?.name ??
@@ -1192,7 +1463,6 @@ export function ConversasContent({
                     ))}
                   </div>
                 )}
-                <div ref={messagesEndRef} />
               </div>
 
               {refreshError && (
@@ -1278,6 +1548,19 @@ export function ConversasContent({
           )}
         </section>
       </div>
+
+      {lightbox?.kind === "image" && (
+        <MediaLightbox
+          messageId={lightbox.messageId}
+          onClose={() => setLightbox(null)}
+        />
+      )}
+      {lightbox?.kind === "document" && (
+        <DocumentLightbox
+          messageId={lightbox.messageId}
+          onClose={() => setLightbox(null)}
+        />
+      )}
 
       {incomingToast && (
         <button
@@ -1634,11 +1917,763 @@ function resolveSenderName(
   return "Enviado pelo celular";
 }
 
+function mediaUrl(messageId: string, options?: { download?: boolean }): string {
+  const path = `/api/whatsapp/messages/${encodeURIComponent(messageId)}/media`;
+  return options?.download ? `${path}?download=1` : path;
+}
+
+// Faz download de uma midia para o disco do operador. Usa fetch + blob URL
+// porque o servidor expoe Content-Disposition; o atributo `download` do <a>
+// e necessario para o browser escolher "salvar" em vez de "navegar".
+async function downloadMedia(messageId: string): Promise<void> {
+  try {
+    const res = await fetch(mediaUrl(messageId, { download: true }));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cd = res.headers.get("Content-Disposition") ?? "";
+    const match = cd.match(/filename="([^"]+)"/i);
+    const filename = match?.[1] ?? `whatsapp-${messageId.slice(0, 8)}.bin`;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    console.error("[downloadMedia] failed:", err);
+  }
+}
+
+// Renderiza um sticker via /api/whatsapp/messages/[id]/media (que faz o
+// decrypt na Evolution e devolve o webp/png). Mantem fallback textual em
+// caso de erro de rede ou midia indisponivel — alguma instancia pode nao
+// conseguir decodificar todos os stickers (mediaKey ausente, etc).
+function StickerImage({ messageId }: { messageId: string }) {
+  const [errored, setErrored] = useState(false);
+  if (errored) {
+    return <p className="italic text-gray-500">[sticker]</p>;
+  }
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={mediaUrl(messageId)}
+      alt="Sticker"
+      className="h-32 w-32 select-none object-contain"
+      draggable={false}
+      onError={() => setErrored(true)}
+    />
+  );
+}
+
+// Imagem inline na bolha. Click abre o lightbox em tela cheia (com download
+// e fechar). Tamanho maximo permite varias imagens roladas sem dominar o
+// viewport; cursor-zoom-in indica a interacao.
+function MessageImage({
+  messageId,
+  onOpen,
+}: {
+  messageId: string;
+  onOpen: () => void;
+}) {
+  const [errored, setErrored] = useState(false);
+  if (errored) {
+    return <p className="italic text-gray-500">[imagem]</p>;
+  }
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label="Abrir imagem em tela cheia"
+      className="block overflow-hidden rounded-lg"
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={mediaUrl(messageId)}
+        alt="Imagem recebida"
+        className="block max-h-64 w-auto cursor-zoom-in object-cover"
+        onError={() => setErrored(true)}
+      />
+    </button>
+  );
+}
+
+// Player nativo de video. Carrega sob demanda: enquanto o operador rola o
+// chat, mostra um placeholder com botao "play"; so apos o click o <video>
+// e renderizado e a midia comeca a baixar (autoPlay para sequencia natural
+// do clique). Isso evita decodes/conversoes pesadas em rajada na Evolution
+// e trafego desnecessario para videos que o operador talvez nem va abrir.
+function MessageVideo({ messageId }: { messageId: string }) {
+  const [load, setLoad] = useState(false);
+  const [errored, setErrored] = useState(false);
+  if (errored) {
+    return <p className="italic text-gray-500">[video]</p>;
+  }
+  if (!load) {
+    return (
+      <button
+        type="button"
+        onClick={() => setLoad(true)}
+        aria-label="Reproduzir video"
+        className="flex h-40 w-60 items-center justify-center gap-2 rounded-lg bg-gray-200/80 text-gray-700 transition-colors hover:bg-gray-300/80"
+      >
+        <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-white/80 text-emerald-700 shadow">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <polygon points="6 4 20 12 6 20 6 4" />
+          </svg>
+        </span>
+        <span className="text-xs font-medium">Reproduzir video</span>
+      </button>
+    );
+  }
+  return (
+    <video
+      controls
+      autoPlay
+      preload="metadata"
+      src={mediaUrl(messageId)}
+      onError={() => setErrored(true)}
+      className="block max-h-72 w-auto rounded-lg bg-black"
+    />
+  );
+}
+
+// Formata duracao de audio em "M:SS" (ou "MM:SS" para audios longos).
+// Usado tanto para tempo decorrido quanto para duracao total.
+function formatAudioTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+const AUDIO_SPEED_CYCLE = [1, 1.5, 2] as const;
+
+// Player de audio inspirado no WhatsApp Web. Funcionalidades:
+//   - Play/Pause sem reload (usa <audio> escondido controlado por ref).
+//   - Barra de progresso clicavel para seek arbitrario.
+//   - Botao de velocidade que cicla 1x -> 1.5x -> 2x -> 1x.
+//   - Tempo decorrido / duracao total.
+//   - Botao de download (faz fetch + blob URL).
+//
+// Lazy-load: `preload="none"` para nao disparar GET na rota (e portanto
+// chamada Evolution) ao apenas renderizar o chat. O navegador so puxa o
+// arquivo quando o operador clica em play.
+//
+// Workaround `duration=Infinity`: audios `.ogg/opus` vindos do WhatsApp
+// frequentemente reportam `Infinity` no primeiro `loadedmetadata` em
+// browsers Chromium. A correcao classica e fazer seek para um valor alto
+// e voltar — apos o seek, o browser recalcula a duracao real.
+function MessageAudio({
+  messageId,
+  isMe,
+}: {
+  messageId: string;
+  isMe: boolean;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const progressBarRef = useRef<HTMLDivElement | null>(null);
+  const durationFixedRef = useRef(false);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [speedIndex, setSpeedIndex] = useState(0);
+  const [errored, setErrored] = useState(false);
+
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+
+    function tryFixDuration() {
+      if (!a) return;
+      // Se o browser ja conseguiu calcular a duracao certa, usa direto.
+      if (Number.isFinite(a.duration) && a.duration > 0) {
+        setDuration(a.duration);
+        durationFixedRef.current = true;
+        return;
+      }
+      // Workaround para ogg/opus do WhatsApp: seek pra "infinito" forca
+      // o decoder a percorrer o arquivo e descobrir a duracao real. Apos
+      // o seek, voltamos ao inicio e o `durationchange` traz o valor.
+      if (!durationFixedRef.current) {
+        durationFixedRef.current = true;
+        const onceDuration = () => {
+          if (!a) return;
+          if (Number.isFinite(a.duration) && a.duration > 0) {
+            setDuration(a.duration);
+            a.currentTime = 0;
+          }
+          a.removeEventListener("durationchange", onceDuration);
+        };
+        a.addEventListener("durationchange", onceDuration);
+        try {
+          a.currentTime = 1e10;
+        } catch {
+          // alguns browsers lancam se currentTime > seekable range; ignora.
+        }
+      }
+    }
+
+    function onLoadedMetadata() {
+      tryFixDuration();
+    }
+    function onDurationChange() {
+      if (Number.isFinite(a.duration) && a.duration > 0) {
+        setDuration(a.duration);
+      }
+    }
+    function onTimeUpdate() {
+      setCurrentTime(a.currentTime);
+    }
+    function onPlay() {
+      setPlaying(true);
+    }
+    function onPause() {
+      setPlaying(false);
+    }
+    function onEnded() {
+      setPlaying(false);
+      setCurrentTime(0);
+      try {
+        a.currentTime = 0;
+      } catch {
+        /* noop */
+      }
+    }
+    function onError() {
+      setErrored(true);
+      setPlaying(false);
+    }
+
+    a.addEventListener("loadedmetadata", onLoadedMetadata);
+    a.addEventListener("durationchange", onDurationChange);
+    a.addEventListener("timeupdate", onTimeUpdate);
+    a.addEventListener("play", onPlay);
+    a.addEventListener("pause", onPause);
+    a.addEventListener("ended", onEnded);
+    a.addEventListener("error", onError);
+    return () => {
+      a.removeEventListener("loadedmetadata", onLoadedMetadata);
+      a.removeEventListener("durationchange", onDurationChange);
+      a.removeEventListener("timeupdate", onTimeUpdate);
+      a.removeEventListener("play", onPlay);
+      a.removeEventListener("pause", onPause);
+      a.removeEventListener("ended", onEnded);
+      a.removeEventListener("error", onError);
+    };
+  }, []);
+
+  function togglePlay() {
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) {
+      void a.play().catch(() => setErrored(true));
+    } else {
+      a.pause();
+    }
+  }
+
+  function cycleSpeed() {
+    const next = (speedIndex + 1) % AUDIO_SPEED_CYCLE.length;
+    setSpeedIndex(next);
+    const a = audioRef.current;
+    if (a) a.playbackRate = AUDIO_SPEED_CYCLE[next];
+  }
+
+  function seekFromEvent(clientX: number) {
+    const a = audioRef.current;
+    const bar = progressBarRef.current;
+    if (!a || !bar || duration <= 0) return;
+    const rect = bar.getBoundingClientRect();
+    const ratio = Math.min(
+      1,
+      Math.max(0, (clientX - rect.left) / rect.width)
+    );
+    a.currentTime = ratio * duration;
+    setCurrentTime(a.currentTime);
+  }
+
+  if (errored) {
+    return <p className="italic text-gray-500">[audio]</p>;
+  }
+
+  const speed = AUDIO_SPEED_CYCLE[speedIndex];
+  const progressPct =
+    duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const trackBg = isMe ? "bg-emerald-200/70" : "bg-gray-200";
+  const fillBg = isMe ? "bg-emerald-600" : "bg-emerald-500";
+  const buttonBg = isMe
+    ? "bg-emerald-600 text-white hover:bg-emerald-700"
+    : "bg-emerald-500 text-white hover:bg-emerald-600";
+  const speedBadge = isMe
+    ? "bg-emerald-50 text-emerald-800 hover:bg-white"
+    : "bg-gray-100 text-gray-700 hover:bg-gray-200";
+
+  return (
+    <div className="flex w-64 items-center gap-3">
+      <audio ref={audioRef} src={mediaUrl(messageId)} preload="none" />
+      <button
+        type="button"
+        onClick={togglePlay}
+        aria-label={playing ? "Pausar audio" : "Reproduzir audio"}
+        className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full shadow-sm transition-colors ${buttonBg}`}
+      >
+        {playing ? (
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <rect x="6" y="5" width="4" height="14" rx="1" />
+            <rect x="14" y="5" width="4" height="14" rx="1" />
+          </svg>
+        ) : (
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <polygon points="6 4 20 12 6 20 6 4" />
+          </svg>
+        )}
+      </button>
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div
+          ref={progressBarRef}
+          role="slider"
+          aria-valuemin={0}
+          aria-valuemax={duration || 0}
+          aria-valuenow={currentTime}
+          aria-label="Progresso do audio"
+          tabIndex={0}
+          onClick={(e) => seekFromEvent(e.clientX)}
+          onKeyDown={(e) => {
+            if (!audioRef.current || duration <= 0) return;
+            if (e.key === "ArrowRight") {
+              e.preventDefault();
+              audioRef.current.currentTime = Math.min(
+                duration,
+                audioRef.current.currentTime + 5
+              );
+            } else if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              audioRef.current.currentTime = Math.max(
+                0,
+                audioRef.current.currentTime - 5
+              );
+            }
+          }}
+          className={`relative h-1.5 cursor-pointer rounded-full ${trackBg}`}
+        >
+          <div
+            className={`h-full rounded-full ${fillBg}`}
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-2 text-[10px] text-gray-500">
+          <span>{formatAudioTime(currentTime)}</span>
+          <span>
+            {duration > 0 ? formatAudioTime(duration) : "--:--"}
+          </span>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={cycleSpeed}
+        aria-label={`Velocidade ${speed}x`}
+        title={`Velocidade ${speed}x (clique para alterar)`}
+        className={`inline-flex h-7 shrink-0 items-center justify-center rounded-full px-2 text-[10px] font-semibold transition-colors ${speedBadge}`}
+      >
+        {speed}x
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          void downloadMedia(messageId);
+        }}
+        aria-label="Baixar audio"
+        title="Baixar audio"
+        className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors ${speedBadge}`}
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="13"
+          height="13"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="7 10 12 15 17 10" />
+          <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+// Card de documento ao estilo WhatsApp: icone do tipo de arquivo a esquerda,
+// nome (truncado) e extensao no meio, botoes "abrir/preview" e "baixar" a
+// direita. Para PDF, click no card abre o `DocumentLightbox` com preview
+// inline (iframe nativo do browser). Outros tipos so abrem o download
+// (browser sem viewer integrado).
+function MessageDocument({
+  messageId,
+  fileName,
+  mimeType,
+  isMe,
+  onOpenPreview,
+}: {
+  messageId: string;
+  fileName: string | null;
+  mimeType: string | null;
+  isMe: boolean;
+  onOpenPreview: () => void;
+}) {
+  const lowerName = (fileName ?? "").toLowerCase();
+  const lowerMime = (mimeType ?? "").toLowerCase();
+  const isPdf =
+    lowerMime.includes("pdf") || lowerName.endsWith(".pdf");
+  const ext = (() => {
+    if (lowerName.includes(".")) {
+      const e = lowerName.split(".").pop() ?? "";
+      if (e.length > 0 && e.length <= 5) return e.toUpperCase();
+    }
+    if (lowerMime) {
+      const sub = lowerMime.split("/")[1]?.split(";")[0]?.split("+")[0] ?? "";
+      if (sub) return sub.toUpperCase();
+    }
+    return "DOC";
+  })();
+  const displayName = fileName?.trim() || `Documento.${ext.toLowerCase()}`;
+
+  function primaryAction() {
+    if (isPdf) onOpenPreview();
+    else void downloadMedia(messageId);
+  }
+
+  const iconBg = isMe
+    ? "bg-emerald-200/80 text-emerald-800"
+    : "bg-gray-200 text-gray-700";
+  const actionBtn = isMe
+    ? "text-emerald-800 hover:bg-emerald-200/60"
+    : "text-gray-600 hover:bg-gray-200/70";
+
+  return (
+    <div className="flex w-72 max-w-full items-center gap-3">
+      <button
+        type="button"
+        onClick={primaryAction}
+        title={isPdf ? "Pre-visualizar PDF" : "Baixar documento"}
+        className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-lg transition-colors ${iconBg}`}
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="22"
+          height="22"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        onClick={primaryAction}
+        title={isPdf ? "Pre-visualizar PDF" : "Baixar documento"}
+        className="min-w-0 flex-1 cursor-pointer text-left"
+      >
+        <p className="truncate text-sm font-medium">{displayName}</p>
+        <p className="text-[10px] uppercase tracking-wide text-gray-500">
+          {ext}
+        </p>
+      </button>
+      {isPdf && (
+        <button
+          type="button"
+          onClick={onOpenPreview}
+          aria-label="Pre-visualizar PDF"
+          title="Pre-visualizar PDF"
+          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors ${actionBtn}`}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => {
+          void downloadMedia(messageId);
+        }}
+        aria-label="Baixar documento"
+        title="Baixar documento"
+        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors ${actionBtn}`}
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="7 10 12 15 17 10" />
+          <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+// Modal de pre-visualizacao de PDF em tela cheia. Usa o viewer nativo do
+// navegador via `<iframe>`, que reaproveita o mesmo Content-Type:
+// application/pdf da rota de midia. Esc / click fora fecha.
+function DocumentLightbox({
+  messageId,
+  onClose,
+}: {
+  messageId: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    function onKey(e: globalThis.KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-black/90 p-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Visualizacao de documento"
+    >
+      <div
+        className="mb-3 flex w-full justify-end gap-2"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            void downloadMedia(messageId);
+          }}
+          aria-label="Baixar documento"
+          title="Baixar documento"
+          className="inline-flex h-9 items-center gap-1.5 rounded-full bg-white/95 px-3 text-xs font-medium text-gray-800 shadow-md transition-colors hover:bg-white"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          Baixar
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Fechar visualizacao"
+          title="Fechar"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/95 text-gray-800 shadow-md transition-colors hover:bg-white"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
+          </svg>
+        </button>
+      </div>
+      <div
+        className="flex-1 overflow-hidden rounded-lg bg-white"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <iframe
+          src={mediaUrl(messageId)}
+          title="Pre-visualizacao do documento"
+          className="h-full w-full"
+        />
+      </div>
+    </div>
+  );
+}
+
+// Modal fullscreen para imagem. Esc fecha; click no fundo fecha; barra
+// superior tem botoes de download e fechar. O <img> usa o cache da rota
+// (mesma URL do thumbnail), entao a abertura e instantanea.
+function MediaLightbox({
+  messageId,
+  onClose,
+}: {
+  messageId: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    function onKey(e: globalThis.KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Visualizacao de imagem"
+    >
+      <div
+        className="relative flex max-h-full max-w-full flex-col items-center"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={mediaUrl(messageId)}
+          alt="Imagem em tela cheia"
+          className="max-h-[88vh] max-w-[90vw] rounded-lg object-contain"
+        />
+        <div className="absolute right-2 top-2 flex gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              void downloadMedia(messageId);
+            }}
+            aria-label="Baixar imagem"
+            title="Baixar imagem"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/95 text-gray-800 shadow-md transition-colors hover:bg-white"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Fechar visualizacao"
+            title="Fechar"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/95 text-gray-800 shadow-md transition-colors hover:bg-white"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Agrupa as reactions normalizadas por emoji para a UI: cada grupo vira
+// um badge unico, com a contagem (quando > 1) e flag "do operador" para
+// permitir o toggle ao clicar.
+interface ReactionGroup {
+  emoji: string;
+  count: number;
+  byMe: boolean;
+}
+
+function groupReactions(list: WhatsAppMessageReaction[]): ReactionGroup[] {
+  const map = new Map<string, ReactionGroup>();
+  for (const r of list) {
+    const existing = map.get(r.emoji);
+    if (existing) {
+      existing.count += 1;
+      if (r.from_me) existing.byMe = true;
+    } else {
+      map.set(r.emoji, { emoji: r.emoji, count: 1, byMe: r.from_me });
+    }
+  }
+  return Array.from(map.values());
+}
+
 function MessageBubble({
   message,
   senderName,
   onReply,
   onJumpToQuote,
+  onReact,
+  onOpenMedia,
   highlighted,
   contactName,
 }: {
@@ -1646,6 +2681,8 @@ function MessageBubble({
   senderName: string | null;
   onReply: (message: WhatsAppMessage) => void;
   onJumpToQuote: (quotedEvoId: string) => void;
+  onReact: (messageId: string, emoji: string) => void;
+  onOpenMedia: (kind: "image" | "document", messageId: string) => void;
   highlighted: boolean;
   contactName: string;
 }) {
@@ -1658,10 +2695,94 @@ function MessageBubble({
   // Mensagem otimista (temp-) ainda nao tem id real no banco; nao podemos
   // usar como replyTo porque o backend nao consegue resolver evolution_message_id.
   const canReply = !message.id.startsWith("temp-");
+  // Reagir tem o mesmo requisito do reply (precisa do evolution_message_id
+  // resolvido no servidor) + a instancia precisa estar conectada (a rota
+  // valida no servidor; aqui so habilitamos o botao para o caminho feliz).
+  const canReact =
+    !message.id.startsWith("temp-") &&
+    Boolean(message.evolution_message_id);
+  // Midia so e exibivel se ja temos id real e evolution_message_id (a rota
+  // de midia precisa do evo id pra decodificar via Evolution). Mensagem
+  // temp- ou sem evoId cai no fallback textual `[image]`/`[video]`/etc.
+  const isPlayableMedia =
+    Boolean(message.evolution_message_id) && !message.id.startsWith("temp-");
+  const isSticker = message.media_type === "sticker" && isPlayableMedia;
+  const isImage = message.media_type === "image" && isPlayableMedia;
+  const isVideo = message.media_type === "video" && isPlayableMedia;
+  const isAudio = message.media_type === "audio" && isPlayableMedia;
+  const isDocument = message.media_type === "document" && isPlayableMedia;
+  // Bolha "naked" (sem fundo/padding) para sticker; padding compacto para
+  // imagem/video (evita espacos enormes ao redor da midia); padding normal
+  // para texto puro / audio / documento (layouts horizontais proprios).
+  const isMedia = isSticker || isImage || isVideo || isAudio || isDocument;
+  const reactionList = normalizeReactions(message.reactions);
+  const reactionGroups = groupReactions(reactionList);
+
+  // Hooks SEMPRE no topo (regras dos hooks do React) — qualquer early-return
+  // tem que vir depois.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerWrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Fecha o picker ao clicar fora. Usamos pointerdown para nao competir com
+  // o click em uma das opcoes do picker (que tambem fecha via handler).
+  useEffect(() => {
+    if (!pickerOpen) return;
+    function onDown(e: PointerEvent) {
+      const wrap = pickerWrapRef.current;
+      if (!wrap) return;
+      if (wrap.contains(e.target as Node)) return;
+      setPickerOpen(false);
+    }
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [pickerOpen]);
+
+  // Defesa contra o lixo legacy: bolhas vazias (media_type unknown + body
+  // null) sem nenhuma reacao agregada nao tem nada para mostrar e poluem
+  // o chat. A partir desta versao o webhook ja nao insere mais essas
+  // linhas, mas mensagens antigas que escaparam do DELETE da migration
+  // ficam ocultas aqui.
+  if (
+    message.media_type === "unknown" &&
+    !message.body &&
+    reactionList.length === 0
+  ) {
+    return null;
+  }
 
   function handleReplyClick(e: React.MouseEvent) {
     e.stopPropagation();
     onReply(message);
+  }
+
+  function handleReactButtonClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    setPickerOpen((prev) => !prev);
+  }
+
+  function handlePickEmoji(emoji: string) {
+    setPickerOpen(false);
+    // Toggle WhatsApp: clicar no MESMO emoji que ja aplicamos remove. Outros
+    // emojis substituem a reacao anterior (regra "1 emoji por reator").
+    // Esta decisao mora na UI porque o backend trata reactionMessage de
+    // forma idempotente — se enviassemos sempre o emoji, entregas duplicadas
+    // pelo cache da Evolution viraria "toggle off" indesejado.
+    const own = reactionList.find((r) => r.from_me);
+    if (own && own.emoji === emoji) {
+      onReact(message.id, "");
+    } else {
+      onReact(message.id, emoji);
+    }
+  }
+
+  function handleBadgeClick(group: ReactionGroup) {
+    // Click numa reacao propria remove (toggle, igual WhatsApp). Click numa
+    // reacao do contato re-aplica o mesmo emoji do operador como atalho.
+    if (group.byMe) {
+      onReact(message.id, "");
+    } else {
+      onReact(message.id, group.emoji);
+    }
   }
 
   function handleQuoteClick() {
@@ -1693,11 +2814,21 @@ function MessageBubble({
         }`}
       >
         <div
-          className={`min-w-0 rounded-2xl px-3 py-2 text-sm shadow-sm transition-shadow ${
-            isMe
-              ? "bg-emerald-100 text-emerald-900"
-              : "bg-white text-gray-900 border border-gray-200"
-          } ${highlighted ? "ring-2 ring-emerald-400 ring-offset-1" : ""}`}
+          className={
+            isSticker
+              ? `min-w-0 ${
+                  highlighted
+                    ? "rounded-lg ring-2 ring-emerald-400 ring-offset-1"
+                    : ""
+                }`
+              : `min-w-0 rounded-2xl text-sm shadow-sm transition-shadow ${
+                  isImage || isVideo ? "p-1.5" : "px-3 py-2"
+                } ${
+                  isMe
+                    ? "bg-emerald-100 text-emerald-900"
+                    : "bg-white text-gray-900 border border-gray-200"
+                } ${highlighted ? "ring-2 ring-emerald-400 ring-offset-1" : ""}`
+          }
         >
           {hasQuote && (
             <button
@@ -1737,12 +2868,57 @@ function MessageBubble({
               </span>
             </button>
           )}
-          {message.body ? (
-            <p className="whitespace-pre-wrap break-words">{message.body}</p>
+          {isSticker ? (
+            <StickerImage messageId={message.id} />
+          ) : isImage ? (
+            <>
+              <MessageImage
+                messageId={message.id}
+                onOpen={() => onOpenMedia("image", message.id)}
+              />
+              {message.body && (
+                <p className="mt-1.5 whitespace-pre-wrap break-words px-1.5 pb-0.5 [overflow-wrap:anywhere]">
+                  {message.body}
+                </p>
+              )}
+            </>
+          ) : isVideo ? (
+            <>
+              <MessageVideo messageId={message.id} />
+              {message.body && (
+                <p className="mt-1.5 whitespace-pre-wrap break-words px-1.5 pb-0.5 [overflow-wrap:anywhere]">
+                  {message.body}
+                </p>
+              )}
+            </>
+          ) : isAudio ? (
+            <MessageAudio messageId={message.id} isMe={isMe} />
+          ) : isDocument ? (
+            <MessageDocument
+              messageId={message.id}
+              fileName={message.body}
+              mimeType={message.media_mime_type}
+              isMe={isMe}
+              onOpenPreview={() => onOpenMedia("document", message.id)}
+            />
+          ) : message.body ? (
+            <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+              {message.body}
+            </p>
           ) : message.media_type !== "text" ? (
             <p className="italic text-gray-500">[{message.media_type}]</p>
           ) : null}
-          <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-gray-500">
+          <div
+            className={`flex items-center justify-end gap-1 text-[10px] text-gray-500 ${
+              isSticker
+                ? "mt-0.5 px-1"
+                : isAudio || isDocument
+                  ? "mt-1"
+                  : isMedia
+                    ? "mt-0.5 px-1.5 pb-0.5"
+                    : "mt-1"
+            }`}
+          >
             <span>{time}</span>
             {isMe && (
               <span aria-label={`Status: ${message.status}`}>
@@ -1764,31 +2940,136 @@ function MessageBubble({
             </p>
           )}
         </div>
-        {canReply && (
-          <button
-            type="button"
-            onClick={handleReplyClick}
-            aria-label="Responder mensagem"
-            title="Responder"
-            className="mt-1 inline-flex h-7 w-7 shrink-0 items-center justify-center self-start rounded-full bg-white text-gray-500 opacity-0 shadow-sm ring-1 ring-gray-200 transition-opacity hover:bg-gray-50 hover:text-emerald-600 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-emerald-400 group-hover/msg:opacity-100"
+        {(canReply || canReact) && (
+          <div
+            className={`mt-1 flex shrink-0 items-center gap-1 self-start ${
+              isMe ? "flex-row-reverse" : "flex-row"
+            }`}
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="9 17 4 12 9 7" />
-              <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
-            </svg>
-          </button>
+            {canReply && (
+              <button
+                type="button"
+                onClick={handleReplyClick}
+                aria-label="Responder mensagem"
+                title="Responder"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-gray-500 opacity-0 shadow-sm ring-1 ring-gray-200 transition-opacity hover:bg-gray-50 hover:text-emerald-600 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-emerald-400 group-hover/msg:opacity-100"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="9 17 4 12 9 7" />
+                  <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+                </svg>
+              </button>
+            )}
+            {canReact && (
+              <div className="relative" ref={pickerWrapRef}>
+                <button
+                  type="button"
+                  onClick={handleReactButtonClick}
+                  aria-label="Reagir a mensagem"
+                  aria-haspopup="dialog"
+                  aria-expanded={pickerOpen}
+                  title="Reagir"
+                  className={`inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-gray-500 shadow-sm ring-1 ring-gray-200 transition-opacity hover:bg-gray-50 hover:text-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-400 ${
+                    pickerOpen
+                      ? "opacity-100"
+                      : "opacity-0 group-hover/msg:opacity-100 focus:opacity-100"
+                  }`}
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                    <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+                    <line x1="9" x2="9.01" y1="9" y2="9" />
+                    <line x1="15" x2="15.01" y1="9" y2="9" />
+                  </svg>
+                </button>
+                {pickerOpen && (
+                  <div
+                    role="dialog"
+                    aria-label="Escolha um emoji"
+                    className={`absolute top-1/2 z-20 flex -translate-y-1/2 items-center gap-0.5 rounded-full border border-gray-200 bg-white p-1 shadow-lg ${
+                      isMe ? "right-full mr-2" : "left-full ml-2"
+                    }`}
+                  >
+                    {QUICK_REACTION_EMOJIS.map((emoji) => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() => handlePickEmoji(emoji)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-full text-lg transition-transform hover:scale-125 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                        aria-label={`Reagir com ${emoji}`}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </div>
+      {reactionGroups.length > 0 && (
+        // Sobreposicao estilo WhatsApp: a pilula de reacao "grudada" no canto
+        // inferior da bolha, com contorno branco para destacar quando o fundo
+        // da bolha tem cor (verde nas nossas, branco/cinza nas do contato).
+        // `relative z-10` garante que o badge fique POR CIMA da bolha — sem
+        // isso o shadow/border-radius da bolha pintava por cima do badge no
+        // ponto de overlap.
+        //
+        // `-mt-2` = 8px de overlap, igual ao `py-2` (padding-bottom) da bolha:
+        // a reacao cobre APENAS a area de padding interno da bolha, nunca o
+        // conteudo (texto, hora ou status "entregue/lida" que ficam a 8px+
+        // do bottom).
+        <div
+          className={`relative z-10 -mt-2 flex flex-wrap gap-1 ${
+            isMe ? "justify-end pr-2" : "justify-start pl-2"
+          }`}
+        >
+          {reactionGroups.map((g) => (
+            <button
+              key={g.emoji}
+              type="button"
+              onClick={() => handleBadgeClick(g)}
+              disabled={!canReact}
+              title={
+                g.byMe
+                  ? "Remover sua reacao"
+                  : `Reagir com ${g.emoji}`
+              }
+              className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-xs leading-none shadow-md ring-2 ring-white transition-colors ${
+                g.byMe
+                  ? "bg-emerald-50 text-emerald-900 hover:bg-emerald-100"
+                  : "bg-white text-gray-700 hover:bg-gray-50"
+              } disabled:cursor-default disabled:opacity-70`}
+            >
+              <span className="text-sm leading-none">{g.emoji}</span>
+              {g.count > 1 && (
+                <span className="text-[10px] font-medium">{g.count}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

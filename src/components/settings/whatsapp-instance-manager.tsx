@@ -37,6 +37,11 @@ export function WhatsAppInstanceManager() {
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
+  // Tempo decorrido desde o inicio da sync atual, em segundos. Atualizado
+  // a cada 1s enquanto syncing=true. Permite mostrar "Sincronizando... 12s"
+  // no botao — feedback honesto, sem prometer duracao certa, ja que o tempo
+  // varia muito conforme a quantidade de chats (de poucos segundos a +1min).
+  const [syncElapsedSeconds, setSyncElapsedSeconds] = useState(0);
   const [cooldownRemaining, setCooldownRemaining] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -44,18 +49,38 @@ export function WhatsAppInstanceManager() {
   const syncedRef = useRef(false);
   const lastSyncAtRef = useRef<number>(0);
   const cooldownTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Marcadores do tick de "tempo decorrido" durante a sync ativa.
+  const syncStartRef = useRef<number>(0);
+  const syncTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Flag para sincronizar o cooldown UI com o servidor apenas uma vez por
+  // montagem do componente. Evita que cada poll do status (a cada 3s durante
+  // connecting) reaplique o contador e dê a sensação de "trava" no UI.
+  const cooldownSyncedFromServerRef = useRef(false);
 
-  function startCooldown() {
-    lastSyncAtRef.current = Date.now();
-    setCooldownRemaining(Math.ceil(SYNC_COOLDOWN_MS / 1000));
+  // Liga (ou substitui) o tick visual do cooldown a partir do timestamp
+  // considerado como "ultima sync". Caso unificado para: sync local recem
+  // bem-sucedido, 429 do servidor e estado inicial vindo do /status.
+  function applyCooldown(lastSyncMs: number) {
+    lastSyncAtRef.current = lastSyncMs;
+    const elapsed = Date.now() - lastSyncMs;
+    const remainingMs = SYNC_COOLDOWN_MS - elapsed;
+    if (remainingMs <= 0) {
+      setCooldownRemaining(0);
+      if (cooldownTickRef.current) {
+        clearInterval(cooldownTickRef.current);
+        cooldownTickRef.current = null;
+      }
+      return;
+    }
+    setCooldownRemaining(Math.ceil(remainingMs / 1000));
     if (cooldownTickRef.current) {
       clearInterval(cooldownTickRef.current);
     }
     cooldownTickRef.current = setInterval(() => {
-      const elapsed = Date.now() - lastSyncAtRef.current;
+      const elapsedNow = Date.now() - lastSyncAtRef.current;
       const remaining = Math.max(
         0,
-        Math.ceil((SYNC_COOLDOWN_MS - elapsed) / 1000)
+        Math.ceil((SYNC_COOLDOWN_MS - elapsedNow) / 1000)
       );
       setCooldownRemaining(remaining);
       if (remaining <= 0 && cooldownTickRef.current) {
@@ -65,22 +90,53 @@ export function WhatsAppInstanceManager() {
     }, 1000);
   }
 
+  // Liga o tick de "tempo decorrido" exibido no botao durante a sync.
+  // Atualiza syncElapsedSeconds a cada 1s. Helper isolado para que tanto
+  // o caminho normal quanto erros parem o tick via stopSyncTick().
+  function startSyncTick() {
+    syncStartRef.current = Date.now();
+    setSyncElapsedSeconds(0);
+    if (syncTickRef.current) {
+      clearInterval(syncTickRef.current);
+    }
+    syncTickRef.current = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - syncStartRef.current) / 1000);
+      setSyncElapsedSeconds(elapsed);
+    }, 1000);
+  }
+
+  function stopSyncTick() {
+    if (syncTickRef.current) {
+      clearInterval(syncTickRef.current);
+      syncTickRef.current = null;
+    }
+    setSyncElapsedSeconds(0);
+  }
+
   async function syncChats() {
     if (!domain || syncing) return;
-    // Bloqueia se ainda esta no cooldown apos um sync recente
     const sinceLast = Date.now() - lastSyncAtRef.current;
     if (lastSyncAtRef.current > 0 && sinceLast < SYNC_COOLDOWN_MS) return;
 
     setSyncing(true);
     setSyncResult(null);
+    setError(null);
+    startSyncTick();
     try {
       const res = await fetch("/api/whatsapp/instance/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ domain }),
       });
+      const payload = (await res.json().catch(() => ({}))) as {
+        synced?: number;
+        total?: number;
+        error?: string;
+        code?: string;
+        retryAfterSeconds?: number;
+        lastManualSyncAt?: string | null;
+      };
       if (res.ok) {
-        const payload = (await res.json()) as { synced?: number; total?: number };
         const synced = payload.synced ?? 0;
         const total = payload.total ?? 0;
         setSyncResult(
@@ -90,9 +146,30 @@ export function WhatsAppInstanceManager() {
               ? "Todas as conversas ja estao sincronizadas."
               : "Nenhuma conversa encontrada na instancia."
         );
-        startCooldown();
+        applyCooldown(Date.now());
+        return;
       }
+      // Cooldown server-side: o admin pode ter sincronizado em outra aba ou
+      // antes de recarregar a pagina. O servidor devolve lastManualSyncAt
+      // para alinhar o tick local com o ciclo real (e nao recomecar do zero).
+      if (res.status === 429 && payload.code === "COOLDOWN") {
+        const lastMs = payload.lastManualSyncAt
+          ? Date.parse(payload.lastManualSyncAt)
+          : Date.now() - (SYNC_COOLDOWN_MS - (payload.retryAfterSeconds ?? 0) * 1000);
+        if (Number.isFinite(lastMs)) {
+          applyCooldown(lastMs);
+        }
+        const wait = payload.retryAfterSeconds ?? 60;
+        setSyncResult(
+          `Sincronizacao recente. Aguarde ${wait}s para tentar novamente.`
+        );
+        return;
+      }
+      setError(payload.error ?? `Falha ao sincronizar (HTTP ${res.status}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro de rede ao sincronizar.");
     } finally {
+      stopSyncTick();
       setSyncing(false);
     }
   }
@@ -114,6 +191,17 @@ export function WhatsAppInstanceManager() {
       setLoading(false);
       return;
     }
+    // Sincroniza o cooldown UI com o servidor na primeira leitura de status.
+    // Se outro admin sincronizou em outra aba ou se o usuario apenas deu F5,
+    // o contador volta a contar de onde estava em vez de zerar — assim a
+    // protecao server-side (cooldown de 60s) fica visivel para o usuario.
+    if (!cooldownSyncedFromServerRef.current && s.instance?.last_manual_sync_at) {
+      const lastMs = Date.parse(s.instance.last_manual_sync_at);
+      if (Number.isFinite(lastMs) && Date.now() - lastMs < SYNC_COOLDOWN_MS) {
+        applyCooldown(lastMs);
+      }
+    }
+    cooldownSyncedFromServerRef.current = true;
     setInstance((prev) => {
       // Detecta transição para connected: dispara sync automático uma vez
       if (
@@ -122,7 +210,9 @@ export function WhatsAppInstanceManager() {
         !syncedRef.current
       ) {
         syncedRef.current = true;
-        // Chama sync fora do setState para não bloquear a atualização de estado
+        // Chama sync fora do setState para não bloquear a atualização de estado.
+        // Se cair em cooldown server-side (admin sincronizou ha < 60s), o
+        // proprio syncChats trata o 429 e ajusta o tick — sem rajada extra.
         setTimeout(() => syncChats(), 0);
       }
       return s.instance;
@@ -144,6 +234,7 @@ export function WhatsAppInstanceManager() {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
       if (cooldownTickRef.current) clearInterval(cooldownTickRef.current);
+      if (syncTickRef.current) clearInterval(syncTickRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [domain]);
@@ -270,13 +361,18 @@ export function WhatsAppInstanceManager() {
                     ? `Aguarde ${cooldownRemaining}s antes de sincronizar novamente para evitar comportamento que possa flagar o numero.`
                     : undefined
                 }
-                className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+                className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50"
               >
-                {syncing
-                  ? "Sincronizando..."
-                  : cooldownRemaining > 0
-                    ? `Aguarde ${cooldownRemaining}s para sincronizar novamente`
-                    : "Sincronizar conversas"}
+                {syncing ? (
+                  <>
+                    <SyncSpinner />
+                    Sincronizando... {syncElapsedSeconds}s
+                  </>
+                ) : cooldownRemaining > 0 ? (
+                  `Aguarde ${cooldownRemaining}s para sincronizar novamente`
+                ) : (
+                  "Sincronizar conversas"
+                )}
               </button>
               <button
                 type="button"
@@ -295,6 +391,11 @@ export function WhatsAppInstanceManager() {
                 Desconectar
               </button>
             </div>
+            {syncing && syncElapsedSeconds >= 15 && (
+              <p className="text-xs text-gray-500">
+                Pode levar ate 1-2 minutos se houver muitos contatos. Aguarde.
+              </p>
+            )}
             {syncResult && (
               <p className="text-xs text-emerald-700">{syncResult}</p>
             )}
@@ -370,6 +471,28 @@ export function WhatsAppInstanceManager() {
         </div>
       )}
     </div>
+  );
+}
+
+// Spinner inline para o botao de Sincronizar. Ressalta visualmente que a
+// requisicao esta em andamento alem do contador "Sincronizando... 12s".
+function SyncSpinner() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="animate-spin"
+      aria-hidden
+    >
+      <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+    </svg>
   );
 }
 

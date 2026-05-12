@@ -7,9 +7,14 @@ import {
   type EvolutionMessageRecord,
 } from "@/lib/evolution/client";
 import type {
+  WhatsAppMessage,
   WhatsAppMessageMediaType,
   WhatsAppMessageStatus,
 } from "@/lib/types/database";
+import {
+  mergeReactions,
+  normalizeReactions,
+} from "@/lib/whatsapp/reactions";
 
 interface LoadHistoryPayload {
   chatId?: string;
@@ -127,19 +132,58 @@ interface ExtractedQuote {
   fromMe: boolean | null;
 }
 
-// Mesma logica do webhook: olha contextInfo dentro de cada sub-objeto de
-// mensagem e devolve o snapshot do quote. Mantida em paralelo com o webhook
-// de proposito — extrair pra um util compartilhado pediria refactor maior
-// e os dois codigos sao curtos e estaveis.
+function buildQuoteFromContext(
+  ctx: Record<string, unknown>,
+  remoteJid: string | null | undefined
+): ExtractedQuote | null {
+  const stanzaId =
+    typeof ctx["stanzaId"] === "string" ? (ctx["stanzaId"] as string) : null;
+  if (!stanzaId) return null;
+  const quotedMsg = ctx["quotedMessage"] as
+    | Record<string, unknown>
+    | undefined;
+  const quotedExtract = extractMessage(quotedMsg);
+  const participant =
+    typeof ctx["participant"] === "string"
+      ? (ctx["participant"] as string)
+      : null;
+  let fromMe: boolean | null = null;
+  if (participant && remoteJid) {
+    fromMe = participant !== remoteJid;
+  }
+  return {
+    evolutionMessageId: stanzaId,
+    body:
+      quotedExtract.body && quotedExtract.body.trim().length > 0
+        ? quotedExtract.body.slice(0, 240)
+        : quotedExtract.mediaType !== "text" &&
+            quotedExtract.mediaType !== "unknown"
+          ? `[${quotedExtract.mediaType}]`
+          : null,
+    fromMe,
+  };
+}
+
+// Mesma logica do webhook: o contextInfo do reply pode aparecer top-level
+// no record (mensagens `conversation`, formato comum em chats `@lid`) ou
+// dentro de cada sub-objeto de `message` (extendedTextMessage etc, formato
+// classico para midia/texto longo). Mantida em paralelo com o webhook de
+// proposito — extrair pra util compartilhado pediria refactor maior e os
+// codigos sao curtos e estaveis.
 function extractQuoted(
   message: Record<string, unknown> | undefined | null,
-  remoteJid: string | null | undefined
+  remoteJid: string | null | undefined,
+  topLevelContextInfo?: Record<string, unknown> | null
 ): ExtractedQuote {
   const empty: ExtractedQuote = {
     evolutionMessageId: null,
     body: null,
     fromMe: null,
   };
+  if (topLevelContextInfo) {
+    const built = buildQuoteFromContext(topLevelContextInfo, remoteJid);
+    if (built) return built;
+  }
   if (!message) return empty;
   const candidates = [
     "extendedTextMessage",
@@ -155,36 +199,56 @@ function extractQuoted(
       | undefined;
     const ctx = sub?.contextInfo;
     if (!ctx) continue;
-    const stanzaId =
-      typeof ctx["stanzaId"] === "string"
-        ? (ctx["stanzaId"] as string)
-        : null;
-    if (!stanzaId) continue;
-    const quotedMsg = ctx["quotedMessage"] as
-      | Record<string, unknown>
-      | undefined;
-    const quotedExtract = extractMessage(quotedMsg);
-    const participant =
-      typeof ctx["participant"] === "string"
-        ? (ctx["participant"] as string)
-        : null;
-    let fromMe: boolean | null = null;
-    if (participant && remoteJid) {
-      fromMe = participant !== remoteJid;
-    }
-    return {
-      evolutionMessageId: stanzaId,
-      body:
-        quotedExtract.body && quotedExtract.body.trim().length > 0
-          ? quotedExtract.body.slice(0, 240)
-          : quotedExtract.mediaType !== "text" &&
-              quotedExtract.mediaType !== "unknown"
-            ? `[${quotedExtract.mediaType}]`
-            : null,
-      fromMe,
-    };
+    const built = buildQuoteFromContext(ctx, remoteJid);
+    if (built) return built;
   }
   return empty;
+}
+
+interface ExtractedReaction {
+  targetEvolutionMessageId: string;
+  emoji: string;
+  ts: string;
+  reactorJid: string | null;
+}
+
+// Detecta reactionMessage no record da Evolution. Estrutura igual ao webhook;
+// duplicada em paralelo aqui para manter os 3 caminhos (webhook, load-history,
+// post-login-sync) auto-contidos. Veja webhook/[instance]/route.ts para os
+// detalhes do payload.
+function extractReaction(
+  message: Record<string, unknown> | undefined | null,
+  outerReactorJid: string | null
+): ExtractedReaction | null {
+  if (!message) return null;
+  const reaction = message["reactionMessage"] as
+    | {
+        key?: { id?: string | null } | null;
+        text?: string | null;
+        senderTimestampMs?: number | string | null;
+      }
+    | undefined;
+  if (!reaction || typeof reaction !== "object") return null;
+  const targetId =
+    typeof reaction.key?.id === "string" ? reaction.key.id : null;
+  if (!targetId) return null;
+  const emoji =
+    typeof reaction.text === "string" ? reaction.text : "";
+  let ts = new Date().toISOString();
+  const rawTs = reaction.senderTimestampMs;
+  if (rawTs != null) {
+    const num = typeof rawTs === "number" ? rawTs : Number(rawTs);
+    if (Number.isFinite(num) && num > 0) {
+      const ms = num > 1e12 ? num : num * 1000;
+      ts = new Date(ms).toISOString();
+    }
+  }
+  return {
+    targetEvolutionMessageId: targetId,
+    emoji,
+    ts,
+    reactorJid: outerReactorJid,
+  };
 }
 
 function mapStatus(raw: string | null | undefined): WhatsAppMessageStatus {
@@ -332,6 +396,49 @@ async function handlePost(req: NextRequest) {
     );
   }
 
+  // === Fallback @lid ===
+  // Quando o chat esta no formato classico (`@s.whatsapp.net`/`@c.us`), parte
+  // do historico recente pode estar armazenada pela Evolution num JID `@lid`
+  // correspondente — quando o WhatsApp passou a usar o modo de privacidade
+  // para esse contato. O `findMessages` no JID classico nao retorna essas
+  // mensagens (Evolution filtra por remoteJid exato). Resolvemos cruzando
+  // com o cache local de chats: procuramos um item `@lid` cujo
+  // `lastMessage.key.remoteJidAlt` aponta para o nosso chat e fazemos um
+  // segundo `findMessages` ali. E dado de cache local — zero impacto em
+  // banimento. Dedup acontece pelo select de existing logo abaixo.
+  const isClassicJid =
+    chatRow.remote_jid.endsWith("@s.whatsapp.net") ||
+    chatRow.remote_jid.endsWith("@c.us");
+  let lidJidUsed: string | null = null;
+  if (isClassicJid) {
+    try {
+      const cachedChats = await evolution.findChats(instanceRow.instance_name);
+      const matchingLid = cachedChats.find((ec) => {
+        if (typeof ec.remoteJid !== "string" || !ec.remoteJid.endsWith("@lid")) {
+          return false;
+        }
+        return ec.lastMessage?.key?.remoteJidAlt === chatRow.remote_jid;
+      });
+      if (matchingLid?.remoteJid) {
+        lidJidUsed = matchingLid.remoteJid;
+        const lidRecords = await evolution.findMessages(
+          instanceRow.instance_name,
+          matchingLid.remoteJid,
+          requested
+        );
+        if (lidRecords.length > 0) {
+          records = [...records, ...lidRecords];
+        }
+      }
+    } catch (err) {
+      // Best-effort: nao quebra o refresh principal se o fallback falhar.
+      console.warn("[load-history] @lid fallback failed:", {
+        remoteJid: chatRow.remote_jid,
+        error: err instanceof Error ? err.message : err,
+      });
+    }
+  }
+
   // Calcula o range de timestamps retornados para diagnostico. Se o range
   // estiver "congelado" entre chamadas (mesmo newest_ts), e sinal de que
   // o cache local Baileys da Evolution nao esta recebendo mensagens novas
@@ -350,6 +457,7 @@ async function handlePost(req: NextRequest) {
     count: records.length,
     oldest_ts: oldestTs,
     newest_ts: newestTs,
+    lid_fallback: lidJidUsed,
   });
 
   if (records.length === 0) {
@@ -394,13 +502,50 @@ async function handlePost(req: NextRequest) {
   // nao-lidas. Mensagens que ja estavam no banco entraram pelo webhook
   // anteriormente e ja contabilizaram (ou nao) no unread_count daquela vez.
   let newIncomingCount = 0;
+  // Reactions agregadas por mensagem alvo (evolution_message_id da original).
+  // Aplicadas em batch APOS o INSERT das mensagens novas — necessario porque
+  // o records pode trazer a mensagem alvo + a reacao no mesmo lote (chat
+  // que migrou para `@lid`, primeira sync etc.).
+  type ReactionEvent = {
+    from_me: boolean;
+    reactor_jid: string | null;
+    emoji: string;
+    ts: string;
+  };
+  const reactionsByTarget = new Map<string, ReactionEvent[]>();
 
   for (const r of records) {
     const evoId = r.key?.id ?? r.id ?? null;
     if (!evoId || existingIds.has(evoId)) continue;
     const fromMe = Boolean(r.key?.fromMe);
+
+    // Reacao: nao gera linha nova; agrega para UPDATE em batch depois.
+    const reaction = extractReaction(r.message ?? undefined, chatRow.remote_jid);
+    if (reaction) {
+      const list =
+        reactionsByTarget.get(reaction.targetEvolutionMessageId) ?? [];
+      list.push({
+        from_me: fromMe,
+        reactor_jid: reaction.reactorJid,
+        emoji: reaction.emoji,
+        ts: reaction.ts,
+      });
+      reactionsByTarget.set(reaction.targetEvolutionMessageId, list);
+      continue;
+    }
+
     const extracted = extractMessage(r.message ?? undefined);
-    const quoted = extractQuoted(r.message ?? undefined, chatRow.remote_jid);
+    // Mensagens nao mapeadas (protocolMessage, locationMessage, contactMessage,
+    // etc) caem em unknown+body null no extractMessage. Antes essas linhas
+    // viravam bolhas vazias `[unknown]` no chat. Como nenhuma carrega texto
+    // que o operador possa ler, pulamos no historico tambem.
+    if (extracted.mediaType === "unknown" && !extracted.body) continue;
+
+    const quoted = extractQuoted(
+      r.message ?? undefined,
+      chatRow.remote_jid,
+      r.contextInfo
+    );
     const ts = tsToIso(r.messageTimestamp);
     toInsert.push({
       company_id: companyId,
@@ -499,6 +644,41 @@ async function handlePost(req: NextRequest) {
         { status: 500 }
       );
     }
+  }
+
+  // Aplica reactions agregadas. Faz um SELECT batch para descobrir quais
+  // targets existem no banco (alguns podem ser de mensagens muito antigas
+  // nao sincronizadas — ignoramos) e um UPDATE por mensagem alvo afetada.
+  if (reactionsByTarget.size > 0) {
+    const targetIds = Array.from(reactionsByTarget.keys());
+    const { data: targets } = await supabaseAdmin
+      .from("whatsapp_messages")
+      .select("id, evolution_message_id, reactions")
+      .eq("company_id", companyId)
+      .in("evolution_message_id", targetIds);
+    const targetRows =
+      (targets as
+        | Pick<WhatsAppMessage, "id" | "evolution_message_id" | "reactions">[]
+        | null) ?? [];
+    await Promise.all(
+      targetRows.map((row) => {
+        const incoming =
+          reactionsByTarget.get(row.evolution_message_id ?? "") ?? [];
+        if (incoming.length === 0) return Promise.resolve();
+        // Ordena por ts asc para aplicar na ordem real dos eventos. Um
+        // reator que reagiu 2x em rajada acaba com o emoji mais recente.
+        incoming.sort((a, b) => (a.ts < b.ts ? -1 : 1));
+        let merged = normalizeReactions(row.reactions);
+        for (const ev of incoming) {
+          merged = mergeReactions(merged, ev);
+        }
+        return supabaseAdmin
+          .from("whatsapp_messages")
+          .update({ reactions: merged })
+          .eq("id", row.id)
+          .then(() => undefined);
+      })
+    );
   }
 
   // Atualiza preview/timestamp/unread do chat se o historico trouxe alguma

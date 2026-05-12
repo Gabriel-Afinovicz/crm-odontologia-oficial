@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { AppShell } from "@/components/layout/app-shell";
 import { SessionProvider } from "@/components/layout/session-provider";
+import { WhatsAppPostLoginSync } from "@/components/layout/whatsapp-post-login-sync";
 import { getAuthSession, getDomainCompany } from "@/lib/supabase/cached-data";
 
 interface DomainLayoutProps {
@@ -41,6 +42,9 @@ export default async function DomainLayout({
       <AppShell domain={domain} showSettings={canAccessSettings}>
         {children}
       </AppShell>
+      {/* Background WhatsApp sync apos login: roda 1x por sessao de aba,
+          fora da pagina /conversas (que tem polling proprio). Nao renderiza UI. */}
+      <WhatsAppPostLoginSync />
     </SessionProvider>
   );
 }
