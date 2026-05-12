@@ -947,6 +947,7 @@ export function ConversasContent({
       quoted_evolution_message_id: null,
       quoted_body: replySnapshot ? replySnapshot.body.slice(0, 240) : null,
       quoted_from_me: replySnapshot ? replySnapshot.fromMe : null,
+      reactions: [],
       created_at: nowIso,
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -2126,11 +2127,13 @@ function MessageAudio({
       tryFixDuration();
     }
     function onDurationChange() {
+      if (!a) return;
       if (Number.isFinite(a.duration) && a.duration > 0) {
         setDuration(a.duration);
       }
     }
     function onTimeUpdate() {
+      if (!a) return;
       setCurrentTime(a.currentTime);
     }
     function onPlay() {
@@ -2140,6 +2143,7 @@ function MessageAudio({
       setPlaying(false);
     }
     function onEnded() {
+      if (!a) return;
       setPlaying(false);
       setCurrentTime(0);
       try {
