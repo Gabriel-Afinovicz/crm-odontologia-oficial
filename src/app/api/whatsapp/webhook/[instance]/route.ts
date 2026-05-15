@@ -224,6 +224,239 @@ function extractReaction(
   };
 }
 
+// Tipo do retorno de `extractEditedMessageBody` / `extractEditFromData`.
+// `originalRemoteJid` so vem preenchido quando o payload trouxer uma key
+// interna distinta da `data.key` externa (ex: `messages.update` sem
+// `data.key`, mas com `data.message.editedMessage.key.{id,remoteJid}`).
+interface EditExtract {
+  originalEvoId: string | null;
+  originalRemoteJid: string | null;
+  originalFromMe: boolean | null;
+  newBody: string | null;
+}
+
+const EMPTY_EDIT: EditExtract = {
+  originalEvoId: null,
+  originalRemoteJid: null,
+  originalFromMe: null,
+  newBody: null,
+};
+
+// Helpers para extrair texto de um sub-objeto Baileys-like (`message`).
+// Suportam `conversation` (texto curto) e `extendedTextMessage.text`
+// (texto longo / com link preview).
+function pickConversation(
+  obj: Record<string, unknown> | null | undefined
+): string | null {
+  if (!obj) return null;
+  const conv = obj["conversation"];
+  if (typeof conv === "string" && conv.trim()) return conv;
+  const ext = obj["extendedTextMessage"] as
+    | { text?: string }
+    | undefined;
+  if (typeof ext?.text === "string" && ext.text.trim()) return ext.text;
+  return null;
+}
+
+function pickKey(
+  obj: Record<string, unknown> | null | undefined
+): { id: string | null; remoteJid: string | null; fromMe: boolean | null } {
+  if (!obj) return { id: null, remoteJid: null, fromMe: null };
+  const k = obj["key"] as
+    | { id?: unknown; remoteJid?: unknown; fromMe?: unknown }
+    | undefined;
+  return {
+    id: typeof k?.id === "string" ? k.id : null,
+    remoteJid: typeof k?.remoteJid === "string" ? k.remoteJid : null,
+    fromMe: typeof k?.fromMe === "boolean" ? k.fromMe : null,
+  };
+}
+
+// Extrai o novo corpo de texto de um payload de edicao da Evolution.
+// A Evolution 2.3.x pode entregar a edicao em varios formatos dependendo da
+// versao, do nome do evento (`messages.edited` vs `messages.update`) e do
+// tipo da mensagem original. Cobrimos os formatos observados na pratica:
+//
+//   Formato A (Evolution ja normalizou):
+//     message = { conversation | extendedTextMessage }  (texto novo direto)
+//
+//   Formato B (Baileys bruto, dois niveis):
+//     message = { editedMessage: { message: { protocolMessage: {
+//       editedMessage: { conversation | extendedTextMessage },
+//       key: { id: <original_id> }
+//     }}}}
+//
+//   Formato C (protocolMessage de tipo 14 direto em message):
+//     message = { protocolMessage: {
+//       editedMessage: { conversation | extendedTextMessage },
+//       key: { id: <original_id> }
+//     }}
+//
+//   Formato D (Baileys "editedMessage" envelope simples — mais comum em
+//   `messages.update` de 2.3.7):
+//     message = { editedMessage: {
+//       key: { id, remoteJid, fromMe },              // id da msg original
+//       message: { conversation | extendedTextMessage | protocolMessage }
+//     }}
+//
+// Retorna `EMPTY_EDIT` quando nenhum corpo identificavel for encontrado.
+function extractEditedMessageBody(
+  message: Record<string, unknown> | undefined | null
+): EditExtract {
+  if (!message) return EMPTY_EDIT;
+
+  // Formato A: conteudo direto em message
+  const directConv = pickConversation(message);
+  if (directConv) {
+    return { ...EMPTY_EDIT, newBody: directConv };
+  }
+
+  // Formato C: protocolMessage na raiz de message
+  const proto = message["protocolMessage"] as
+    | {
+        editedMessage?: Record<string, unknown>;
+        key?: { id?: string | null };
+        type?: number;
+      }
+    | undefined;
+  if (proto?.editedMessage) {
+    const innerConv = pickConversation(proto.editedMessage);
+    if (innerConv) {
+      return {
+        ...EMPTY_EDIT,
+        originalEvoId:
+          typeof proto.key?.id === "string" ? proto.key.id : null,
+        newBody: innerConv,
+      };
+    }
+  }
+
+  // Formatos B e D: envelope `editedMessage` no nivel de `message`.
+  const editedEnvelope = message["editedMessage"] as
+    | {
+        key?: {
+          id?: string | null;
+          remoteJid?: string | null;
+          fromMe?: boolean | null;
+        };
+        message?: Record<string, unknown>;
+      }
+    | undefined;
+  if (editedEnvelope?.message) {
+    const innerMsg = editedEnvelope.message;
+    const envelopeKey = pickKey(editedEnvelope as Record<string, unknown>);
+
+    // D.1: texto direto em `editedMessage.message.{conversation|extendedTextMessage}`
+    const directInner = pickConversation(innerMsg);
+    if (directInner) {
+      return {
+        originalEvoId: envelopeKey.id,
+        originalRemoteJid: envelopeKey.remoteJid,
+        originalFromMe: envelopeKey.fromMe,
+        newBody: directInner,
+      };
+    }
+
+    // B: protocolMessage dentro de `editedMessage.message`
+    const innerProto = innerMsg["protocolMessage"] as
+      | {
+          editedMessage?: Record<string, unknown>;
+          key?: { id?: string | null };
+        }
+      | undefined;
+    if (innerProto?.editedMessage) {
+      const innerProtoConv = pickConversation(innerProto.editedMessage);
+      if (innerProtoConv) {
+        return {
+          originalEvoId:
+            (typeof innerProto.key?.id === "string"
+              ? innerProto.key.id
+              : null) ?? envelopeKey.id,
+          originalRemoteJid: envelopeKey.remoteJid,
+          originalFromMe: envelopeKey.fromMe,
+          newBody: innerProtoConv,
+        };
+      }
+    }
+  }
+
+  return EMPTY_EDIT;
+}
+
+// Extrai edicao a partir do `data` top-level do webhook (nao de `data.message`).
+// Cobre o caso `messages.edited` em que a Evolution coloca tudo no nivel de
+// `data` em vez de aninhar em `data.message`. Tenta varios campos observados
+// em diferentes versoes (`data.editedMessage`, `data.text`, `data.body`).
+function extractEditFromData(
+  data: WebhookData | undefined
+): EditExtract {
+  if (!data) return EMPTY_EDIT;
+
+  // 1) Texto top-level direto (alguns proxies/wrappers normalizam assim)
+  const dataObj = data as unknown as Record<string, unknown>;
+  const topText = dataObj["text"];
+  if (typeof topText === "string" && topText.trim()) {
+    return {
+      originalEvoId: data.key?.id ?? null,
+      originalRemoteJid: data.key?.remoteJid ?? null,
+      originalFromMe:
+        typeof data.key?.fromMe === "boolean" ? data.key.fromMe : null,
+      newBody: topText,
+    };
+  }
+  const topBody = dataObj["body"];
+  if (typeof topBody === "string" && topBody.trim()) {
+    return {
+      originalEvoId: data.key?.id ?? null,
+      originalRemoteJid: data.key?.remoteJid ?? null,
+      originalFromMe:
+        typeof data.key?.fromMe === "boolean" ? data.key.fromMe : null,
+      newBody: topBody,
+    };
+  }
+
+  // 2) `data.editedMessage` no top-level (envelope Baileys)
+  const topEdited = dataObj["editedMessage"] as
+    | Record<string, unknown>
+    | undefined;
+  if (topEdited) {
+    const directConv = pickConversation(topEdited);
+    if (directConv) {
+      return {
+        originalEvoId: data.key?.id ?? null,
+        originalRemoteJid: data.key?.remoteJid ?? null,
+        originalFromMe:
+          typeof data.key?.fromMe === "boolean" ? data.key.fromMe : null,
+        newBody: directConv,
+      };
+    }
+    // pode ser envelope com `.message` interno
+    const inner = topEdited["message"] as
+      | Record<string, unknown>
+      | undefined;
+    if (inner) {
+      const envelopeKey = pickKey(topEdited);
+      const innerConv = pickConversation(inner);
+      if (innerConv) {
+        return {
+          originalEvoId: envelopeKey.id ?? data.key?.id ?? null,
+          originalRemoteJid:
+            envelopeKey.remoteJid ?? data.key?.remoteJid ?? null,
+          originalFromMe:
+            envelopeKey.fromMe ??
+            (typeof data.key?.fromMe === "boolean"
+              ? data.key.fromMe
+              : null),
+          newBody: innerConv,
+        };
+      }
+    }
+  }
+
+  // 3) Cai pra extracao a partir de `data.message` (caminho classico)
+  return extractEditedMessageBody(data.message);
+}
+
 function extractMessage(message: Record<string, unknown> | undefined): ExtractedMessage {
   if (!message) {
     return { body: null, mediaType: "unknown", mediaUrl: null, mediaMimeType: null };
@@ -337,6 +570,62 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     hasBodyApiKey: Boolean(bodyApiKey),
   });
 
+  // Diagnostico: a Evolution 2.3.x emite edicoes principalmente como
+  // `messages.update` com `protocolMessage` dentro de `data.message`, mas o
+  // formato exato varia por versao. Logamos a estrutura do payload (chaves
+  // de cada nivel + dump truncado) para conseguirmos identificar o formato
+  // quando uma edicao for disparada pelo usuario.
+  if (
+    process.env.NODE_ENV !== "production" &&
+    body.event &&
+    /messages\.(update|edited)/i.test(body.event)
+  ) {
+    const dataObj = body.data as Record<string, unknown> | undefined;
+    const dataMsg = dataObj?.["message"] as
+      | Record<string, unknown>
+      | undefined;
+    console.info("[webhook] message-event-debug", {
+      instance: instanceName,
+      event: body.event,
+      dataKeys: dataObj ? Object.keys(dataObj) : null,
+      key: dataObj?.["key"],
+      messageType: dataObj?.["messageType"],
+      hasStatus: Boolean(dataObj?.["status"]),
+      messageKeys: dataMsg ? Object.keys(dataMsg) : null,
+      protocolMessageType:
+        (dataMsg?.["protocolMessage"] as { type?: number } | undefined)?.type,
+      hasEditedMessage: dataMsg
+        ? Boolean(
+            (dataMsg["protocolMessage"] as { editedMessage?: unknown } | undefined)
+              ?.editedMessage ?? dataMsg["editedMessage"]
+          )
+        : false,
+    });
+    // Dump completo (truncado) quando o evento PARECE ser edicao mas as
+    // chaves conhecidas nao casam — assim conseguimos ver onde a Evolution
+    // colocou o texto/ID e estender `extractEditedMessageBody`.
+    const looksLikeEdit =
+      body.event.toLowerCase().includes("edited") ||
+      Boolean(
+        dataMsg &&
+          (dataMsg["editedMessage"] || dataMsg["protocolMessage"])
+      );
+    if (looksLikeEdit) {
+      let dump = "";
+      try {
+        dump = JSON.stringify(body.data, null, 2);
+      } catch {
+        dump = "(falhou ao serializar)";
+      }
+      console.info(
+        "[webhook] edit-payload-dump",
+        instanceName,
+        body.event,
+        dump.length > 4000 ? `${dump.slice(0, 4000)}...(truncado)` : dump
+      );
+    }
+  }
+
   const supabaseAdmin = createAdminClient();
   const { data: instance } = await supabaseAdmin
     .from("whatsapp_instances")
@@ -357,6 +646,38 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
   if (!tokensValid) {
     return NextResponse.json({ error: "FORBIDDEN" }, { status: 403 });
+  }
+
+  // Heartbeat do webhook: o cliente (`useWhatsAppHealth` em
+  // `conversas-content`) usa `whatsapp_instances.webhook_last_seen_at` para
+  // detectar que o webhook esta vivo e suspender o polling de fallback.
+  //
+  // Throttle no proprio WHERE: so atualiza se a coluna estiver NULL ou se
+  // o ultimo heartbeat foi ha mais de 15s. Em rajada (Evolution entrega
+  // varios eventos em sequencia para uma mesma instancia), isso garante
+  // no maximo ~4 UPDATEs/min — limitando o broadcast Realtime para todos
+  // os operadores conectados.
+  //
+  // Fire-and-forget: nao bloqueia o handler nem falha o webhook caso o
+  // UPDATE de heartbeat dê erro. Se falhar, o cliente apenas continua em
+  // modo "webhook nao confiavel" — o comportamento que ja era padrao
+  // antes da otimizacao.
+  {
+    const heartbeatCutoffIso = new Date(Date.now() - 15_000).toISOString();
+    const nowIso = new Date().toISOString();
+    void supabaseAdmin
+      .from("whatsapp_instances")
+      .update({ webhook_last_seen_at: nowIso })
+      .eq("id", instanceRow.id)
+      .or(
+        `webhook_last_seen_at.is.null,webhook_last_seen_at.lt.${heartbeatCutoffIso}`
+      )
+      .then(
+        () => undefined,
+        (err: unknown) => {
+          console.warn("[webhook] heartbeat update failed", err);
+        }
+      );
   }
 
   const event = normalizeEvent(body.event);
@@ -388,7 +709,119 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ ok: true });
   }
 
-  if ((event.startsWith("messages.upsert") || event.startsWith("messages.update")) && data?.key) {
+  // === Caminho rapido para edicoes (vem antes do bloco principal) ===
+  // A Evolution 2.3.7 entrega `messages.update` de edicao SEM `data.key` no
+  // nivel externo (a key fica dentro de `data.message.editedMessage`), e
+  // entrega `messages.edited` COM `data.key` mas SEM `data.message` (texto
+  // em outro lugar do `data`). O bloco principal abaixo exige `data.key`
+  // para resolver `remoteJid` -> chat, entao edicoes caiam fora dele.
+  //
+  // Aqui processamos edicoes independentemente da forma do payload:
+  // tentamos `extractEditFromData` que cobre os varios formatos. Se
+  // identificar uma edicao, processa direto com o admin client (nao precisa
+  // de chat resolvido — atualizamos pela `evolution_message_id` global).
+  if (
+    event.startsWith("messages.update") ||
+    event.startsWith("messages.edited")
+  ) {
+    const editExtract = extractEditFromData(data);
+    if (editExtract.newBody !== null) {
+      const targetEvoId =
+        editExtract.originalEvoId ?? data?.key?.id ?? null;
+      if (!targetEvoId) {
+        console.warn("[webhook] edit: sem id da mensagem original", {
+          instance: instanceName,
+          event,
+        });
+        return NextResponse.json({ ok: true, ignored: "edit_no_target_id" });
+      }
+      // Carregamos `chat_id` aqui para conseguir checar/atualizar a
+      // previa do chat caso esta seja a ultima mensagem.
+      const { data: targetMsg } = await supabaseAdmin
+        .from("whatsapp_messages")
+        .select("id, chat_id, body, original_body, edit_count")
+        .eq("company_id", instanceRow.company_id)
+        .eq("evolution_message_id", targetEvoId)
+        .maybeSingle();
+      const targetRow = targetMsg as {
+        id: string;
+        chat_id: string;
+        body: string | null;
+        original_body: string | null;
+        edit_count: number;
+      } | null;
+      if (!targetRow) {
+        console.warn("[webhook] edit: mensagem alvo nao encontrada", {
+          instance: instanceName,
+          event,
+          targetEvoId,
+        });
+        return NextResponse.json({ ok: true, ignored: "edit_target_missing" });
+      }
+      const ts = data?.messageTimestamp;
+      const editedAtIso =
+        typeof ts === "number"
+          ? new Date(ts * 1000).toISOString()
+          : typeof ts === "string"
+            ? new Date(Number(ts) * 1000).toISOString()
+            : new Date().toISOString();
+      await supabaseAdmin
+        .from("whatsapp_messages")
+        .update({
+          body: editExtract.newBody,
+          edited_at: editedAtIso,
+          original_body: targetRow.original_body ?? targetRow.body,
+          edit_count: (targetRow.edit_count ?? 0) + 1,
+        })
+        .eq("id", targetRow.id);
+
+      // Atualiza a previa da lista lateral SE a mensagem editada for a
+      // mais recente do chat. Sem isso o sidebar continua mostrando o
+      // texto original ate a proxima mensagem chegar — comportamento
+      // diferente do WhatsApp oficial, que reflete a edicao na previa
+      // imediatamente.
+      const { data: latestMsg } = await supabaseAdmin
+        .from("whatsapp_messages")
+        .select("id")
+        .eq("chat_id", targetRow.chat_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const latestRow = (latestMsg as { id: string } | null) ?? null;
+      if (latestRow?.id === targetRow.id) {
+        const newPreview = editExtract.newBody.slice(0, 120);
+        await supabaseAdmin
+          .from("whatsapp_chats")
+          .update({ last_message_preview: newPreview })
+          .eq("id", targetRow.chat_id);
+      }
+
+      console.info("[webhook] edit aplicada", {
+        instance: instanceName,
+        event,
+        targetEvoId,
+        editCount: (targetRow.edit_count ?? 0) + 1,
+      });
+      return NextResponse.json({ ok: true, edited: true });
+    }
+    // Se nao identificamos edicao mas o evento e `messages.edited`, loga
+    // e ignora (nao tem mais nada a fazer com este evento). Para
+    // `messages.update`, segue o fluxo normal de status update abaixo.
+    if (event.startsWith("messages.edited")) {
+      console.warn(
+        "[webhook] messages.edited sem corpo extraivel — payload acima",
+        { instance: instanceName }
+      );
+      return NextResponse.json({ ok: true, ignored: "edit_body_not_extracted" });
+    }
+  }
+
+  if (
+    (event.startsWith("messages.upsert") ||
+      event.startsWith("messages.update") ||
+      event.startsWith("messages.edited")) &&
+    data?.key
+  ) {
     const rawRemoteJid = data.key.remoteJid;
     const evoMsgId = data.key.id ?? null;
     const fromMe = Boolean(data.key.fromMe);
@@ -454,6 +887,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: true });
     }
 
+    // Edicao ja foi tratada no caminho rapido la em cima (antes deste
+    // bloco). Aqui chegamos so para `messages.upsert` (mensagem nova) ou
+    // `messages.update` puramente de status (sent/delivered/read).
     if (event.startsWith("messages.update")) {
       const status = mapStatus(data.status);
       if (status && evoMsgId) {
@@ -462,6 +898,27 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
           .update({ status })
           .eq("company_id", instanceRow.company_id)
           .eq("evolution_message_id", evoMsgId);
+        // Se este UPDATE de status for da mensagem que ja era a ultima
+        // do chat (mesmo `evolution_message_id` ou o `created_at` mais
+        // recente), propagamos para `whatsapp_chats.last_message_status`
+        // para que os checks na previa da lista lateral atualizem em
+        // tempo real (sent -> delivered -> read). Comparamos pelo evo id
+        // contra a ultima mensagem registrada no chat.
+        const { data: latestMsg } = await supabaseAdmin
+          .from("whatsapp_messages")
+          .select("evolution_message_id")
+          .eq("chat_id", chatId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const latestRow =
+          (latestMsg as { evolution_message_id: string | null } | null) ?? null;
+        if (latestRow?.evolution_message_id === evoMsgId) {
+          await supabaseAdmin
+            .from("whatsapp_chats")
+            .update({ last_message_status: status })
+            .eq("id", chatId);
+        }
       }
       return NextResponse.json({ ok: true });
     }
@@ -587,6 +1044,11 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const updateChat: Record<string, unknown> = {
       last_message_at: tsIso,
       last_message_preview: preview,
+      // Permite a UI da lista lateral mostrar checks no padrao WhatsApp:
+      // so renderiza quando `last_message_from_me === true`. Mensagens
+      // recebidas da outra parte deixam o status nulo (irrelevante).
+      last_message_from_me: fromMe,
+      last_message_status: fromMe ? "sent" : null,
       unread_count: newUnread,
     };
     if (!chatBeforeRow?.name && data.pushName) {

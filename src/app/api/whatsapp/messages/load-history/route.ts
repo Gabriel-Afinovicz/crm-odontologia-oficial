@@ -498,6 +498,10 @@ async function handlePost(req: NextRequest) {
   let latestTs: string | null = null;
   let latestPreview: string | null = null;
   let latestFromMe = false;
+  // Status calculado abaixo (sent/delivered/read/null). So vai parar em
+  // last_message_status do chat se a mensagem mais recente do batch for
+  // realmente a ultima registrada no chat (compara timestamps).
+  let latestStatus: WhatsAppMessageStatus | null = null;
   // Conta apenas mensagens NOVAS (nao-existentes) e IN para o badge de
   // nao-lidas. Mensagens que ja estavam no banco entraram pelo webhook
   // anteriormente e ja contabilizaram (ou nao) no unread_count daquela vez.
@@ -578,6 +582,10 @@ async function handlePost(req: NextRequest) {
         ? extracted.body.slice(0, 120)
         : `[${extracted.mediaType}]`;
       latestFromMe = fromMe;
+      // Para mensagens proprias usamos o status reportado pela Evolution
+      // (sent/delivered/read); para recebidas, status do chat e nulo
+      // porque os checks so fazem sentido em mensagens minhas.
+      latestStatus = fromMe ? mapStatus(r.status) : null;
     }
   }
 
@@ -712,6 +720,8 @@ async function handlePost(req: NextRequest) {
         .update({
           last_message_at: latestTs,
           last_message_preview: latestPreview ?? "[mensagem]",
+          last_message_from_me: latestFromMe,
+          last_message_status: latestStatus,
           unread_count: newUnread,
         })
         .eq("id", chatRow.id);

@@ -18,12 +18,15 @@ import type {
   WhatsAppInstance,
   WhatsAppMessage,
   WhatsAppMessageReaction,
+  WhatsAppMessageStatus,
 } from "@/lib/types/database";
 import {
   QUICK_REACTION_EMOJIS,
   mergeReactions,
   normalizeReactions,
 } from "@/lib/whatsapp/reactions";
+import { useWhatsAppEvents } from "@/lib/whatsapp/use-whatsapp-events";
+import { useWhatsAppHealth } from "@/lib/whatsapp/use-whatsapp-health";
 
 interface ConversasContentProps {
   domain: string;
@@ -43,6 +46,28 @@ function compareChatsDesc(a: WhatsAppChat, b: WhatsAppChat): number {
   if (!at) return 1;
   if (!bt) return -1;
   return bt.localeCompare(at);
+}
+
+// Janela de 15 minutos do WhatsApp para edicao de mensagem propria.
+// Usada client-side para esconder o botao "Editar" em mensagens antigas
+// (a rota tambem valida server-side antes de chamar a Evolution).
+// Mantemos folga de 30s do limite real (15 min) para evitar que o
+// operador clique em "Editar" e a Evolution rejeite no exato momento.
+const WHATSAPP_EDIT_WINDOW_MS = 15 * 60 * 1000 - 30 * 1000;
+
+// Calcula se uma mensagem ainda esta dentro da janela de edicao.
+// Centralizado para que o botao no MessageBubble e a validacao em
+// `submitEdit` usem a mesma regra (evita race entre click e disparo).
+function canEditMessageNow(message: WhatsAppMessage): boolean {
+  if (!message.from_me) return false;
+  if (message.media_type !== "text") return false;
+  if (!message.evolution_message_id) return false;
+  if (message.id.startsWith("temp-")) return false;
+  const sentAtMs = new Date(
+    message.sent_at ?? message.created_at
+  ).getTime();
+  if (!Number.isFinite(sentAtMs)) return false;
+  return Date.now() - sentAtMs < WHATSAPP_EDIT_WINDOW_MS;
 }
 
 // Faz upsert idempotente de uma mensagem no array, deduplicando por id real e
@@ -159,6 +184,183 @@ function fmtTime(iso: string | null) {
   return d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
 }
 
+// Renderiza os "checks" de status (✓ / ✓✓ / ✓✓ azul) padrao WhatsApp para
+// uma mensagem propria. `null`/desconhecido nao renderiza nada.
+//
+//   - pending  -> relogio (em transito, ainda nao confirmado pelo servidor)
+//   - sent     -> 1 check cinza (Evolution confirmou recebimento)
+//   - delivered-> 2 checks cinza (entregue ao celular do contato)
+//   - read     -> 2 checks azuis (lida pelo contato)
+//   - failed   -> ! vermelho
+//
+// Reutilizado tanto no rodape da bolha quanto na previa da lista lateral
+// (so quando `last_message_from_me === true`). O `size` controla o tamanho
+// pixelar (default 14, prefira 12 na lista lateral para nao competir com
+// o texto da previa).
+function MessageStatusChecks({
+  status,
+  size = 14,
+}: {
+  status: WhatsAppMessageStatus | null | undefined;
+  size?: number;
+}) {
+  if (!status) return null;
+  if (status === "pending") {
+    return (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="text-gray-400"
+        aria-label="Enviando"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <polyline points="12 7 12 12 15 14" />
+      </svg>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="text-red-500"
+        aria-label="Falha ao enviar"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <line x1="12" y1="8" x2="12" y2="13" />
+        <line x1="12" y1="16" x2="12.01" y2="16" />
+      </svg>
+    );
+  }
+  // sent / delivered / read renderizam o mesmo "duplo check": para `sent`
+  // suprimimos o segundo check (alinhando com WhatsApp). Cor muda para
+  // azul (`text-sky-500`) em `read`.
+  const color = status === "read" ? "text-sky-500" : "text-gray-500";
+  const label =
+    status === "read"
+      ? "Lida"
+      : status === "delivered"
+        ? "Entregue"
+        : "Enviada";
+  return (
+    <span
+      className={`inline-flex items-center ${color}`}
+      role="img"
+      aria-label={label}
+      title={label}
+    >
+      {/* Padrao WhatsApp: 2 checks justapostos com leve sobreposicao
+          horizontal. Para `sent`, o segundo check fica invisivel (mantem
+          o mesmo bounding box do duplo, evitando "pulo" de layout quando
+          status muda de sent -> delivered). */}
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+      >
+        <polyline points="4 13 9 18 20 7" />
+      </svg>
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+        className={`-ml-[0.45em] ${status === "sent" ? "invisible" : ""}`}
+      >
+        <polyline points="4 13 9 18 20 7" />
+      </svg>
+    </span>
+  );
+}
+
+// Detecta URLs no texto e transforma em links clicaveis preservando o restante
+// do conteudo intacto (inclusive quebras de linha e emojis). Aceita os formatos
+// "http://...", "https://..." e "www..." (o ultimo recebe `https://` no href
+// automaticamente — comportamento padrao do WhatsApp/Telegram).
+//
+// Por que regex inline e nao biblioteca: 1) zero dependencia nova; 2) cobertura
+// de >95% das URLs reais que aparecem em chats de clinica (endereco curto,
+// links de Maps, formularios, etc); 3) e robusto contra HTML injection porque
+// React escapa por padrao — o `href` recebe a string original sem
+// `dangerouslySetInnerHTML`. Caracteres `<`/`>`/espacos cortam a URL.
+const URL_REGEX = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)/gi;
+
+function renderTextWithLinks(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  // RegExp com flag /g preserva lastIndex entre execs — perfeito para
+  // particionar a string sem reconstruir. Reset via `exec` natural.
+  URL_REGEX.lastIndex = 0;
+  while ((match = URL_REGEX.exec(text)) !== null) {
+    const [rawUrl] = match;
+    const start = match.index;
+    if (start > lastIndex) {
+      out.push(text.slice(lastIndex, start));
+    }
+    // Algumas pontuacoes finais nao fazem parte da URL real (".", ",", ")",
+    // "!", "?"). Empurra esses caracteres pra fora do link pra evitar o
+    // classico bug de "link com . no final que nao abre". WhatsApp faz igual.
+    let url = rawUrl;
+    let trailing = "";
+    while (/[.,!?)\]}>;:]$/.test(url)) {
+      trailing = url.slice(-1) + trailing;
+      url = url.slice(0, -1);
+    }
+    if (url.length === 0) {
+      out.push(rawUrl);
+      lastIndex = start + rawUrl.length;
+      continue;
+    }
+    const href = url.startsWith("http") ? url : `https://${url}`;
+    out.push(
+      <a
+        key={`u-${start}`}
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-blue-600 underline [overflow-wrap:anywhere] hover:text-blue-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {url}
+      </a>
+    );
+    if (trailing) out.push(trailing);
+    lastIndex = start + rawUrl.length;
+  }
+  if (lastIndex < text.length) {
+    out.push(text.slice(lastIndex));
+  }
+  return out;
+}
+
 export function ConversasContent({
   domain,
   companyId,
@@ -218,6 +420,20 @@ export function ConversasContent({
     fromMe: boolean;
     senderLabel: string;
   } | null>(null);
+  // Edicao ativa: snapshot da mensagem que esta sendo editada. O `draft`
+  // e pre-preenchido com o `originalBody` quando esse estado e setado, e
+  // o `handleSend` redireciona para `submitEdit` em vez de criar mensagem
+  // nova enquanto este estado existir. Reply e edicao sao mutualmente
+  // exclusivos: ativar um cancela o outro (igual WhatsApp).
+  const [editingMessage, setEditingMessage] = useState<{
+    messageId: string;
+    originalBody: string;
+  } | null>(null);
+  // Marca quando uma edicao esta no ar, para desabilitar o botao Enviar
+  // e impedir disparos duplicados via Enter rapido. Independente do
+  // `sending` global usado para mensagem nova/midia (cuja indicacao e
+  // outra: rajada na fila).
+  const [editing, setEditing] = useState(false);
   // Mensagem brevemente destacada apos clicar em uma citacao. O highlight
   // dura ~1.5s e some — simula o "pulse" do WhatsApp ao localizar o original.
   const [highlightedMessageId, setHighlightedMessageId] = useState<
@@ -272,6 +488,26 @@ export function ConversasContent({
   // pelo usuario, mesmo se varias forem disparadas em rapida sucessao.
   const sendQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const pendingSendsRef = useRef(0);
+
+  // Map tempId -> objectURL local da midia em envio. Permite renderizar
+  // imediatamente o thumbnail/preview na bolha otimista sem esperar a
+  // Evolution decodificar via rota /media. Trocado por mediaUrl(realId)
+  // assim que o servidor responde. `useState` em vez de `useRef` para
+  // forcar re-render quando muda — refs nao notificam React por si so.
+  // O `tempMediaPreviewsRef` espelha o state para que o cleanup do unmount
+  // pegue a versao mais recente (state em useEffect com deps `[]` captura
+  // sempre a inicial). Ambos sao atualizados em sincronia.
+  const [tempMediaPreviews, setTempMediaPreviews] = useState<
+    Map<string, string>
+  >(() => new Map());
+  const tempMediaPreviewsRef = useRef(tempMediaPreviews);
+  useEffect(() => {
+    tempMediaPreviewsRef.current = tempMediaPreviews;
+  }, [tempMediaPreviews]);
+  // Estado do modal de preview da midia antes do envio. `null` = nenhum
+  // arquivo selecionado; quando setado, mostra MediaPreviewDialog.
+  const [pendingMediaFile, setPendingMediaFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     hasMoreRef.current = hasMore;
   }, [hasMore]);
@@ -287,6 +523,12 @@ export function ConversasContent({
   // com replyTo "fantasma" no chat novo.
   useEffect(() => {
     setReplyingTo(null);
+    // Mesma logica para edicao: a mensagem editada pertence a outro chat,
+    // nao deve continuar editavel ao trocar. O draft tambem volta vazio
+    // para evitar que o operador envie por engano o conteudo da edicao
+    // antiga como mensagem nova no chat novo.
+    setEditingMessage(null);
+    setDraft("");
   }, [activeChatId]);
 
   const activeChat = useMemo(
@@ -507,118 +749,125 @@ export function ConversasContent({
     isNearBottomRef.current = distanceFromBottom < 150;
   }
 
-  // Realtime: chats e messages da company.
-  // Importante: NAO usamos filter no servidor (postgres_changes filter)
-  // porque em algumas versoes do Realtime o filtro por UUID pode entregar
-  // INSERTs de forma inconsistente. Em vez disso, deixamos a RLS filtrar
-  // por company (ja faz isso) e aplicamos um filtro client-side adicional.
-  useEffect(() => {
-    const supabase = createClient();
-    // Nome de canal unico por mount evita que React StrictMode/HMR em dev
-    // mantenham dois subscribers ativos no mesmo nome de canal e entreguem
-    // o mesmo evento em duplicidade.
-    const channelName = `whatsapp-${companyId}-${Math.random().toString(36).slice(2, 9)}`;
-    const channel = supabase
-      .channel(channelName)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "whatsapp_chats",
-        },
-        (payload) => {
-          const next = payload.new as WhatsAppChat | null;
-          const old = payload.old as WhatsAppChat | null;
-          if (payload.eventType === "DELETE" && old) {
-            if (old.company_id !== companyId) return;
-            setChats((prev) => prev.filter((c) => c.id !== old.id));
-            return;
-          }
-          if (!next) return;
-          if (next.company_id !== companyId) return;
-          setChats((prev) => {
-            const idx = prev.findIndex((c) => c.id === next.id);
-            if (idx !== -1) {
-              const copy = [...prev];
-              copy[idx] = next;
-              copy.sort(compareChatsDesc);
-              return copy;
-            }
-            const lastVisible = prev[prev.length - 1];
-            const lastTs = lastVisible?.last_message_at ?? null;
-            const nextTs = next.last_message_at ?? null;
-            const stillHasMore = hasMoreRef.current;
-            const fitsInPage =
-              !stillHasMore ||
-              (nextTs != null && (lastTs == null || nextTs > lastTs));
-            if (!fitsInPage) {
-              return prev;
-            }
-            return [...prev, next].sort(compareChatsDesc);
-          });
+  // Hub semantico de eventos do WhatsApp para esta company.
+  //
+  // Transporta tudo num unico canal Supabase Realtime (Phoenix WebSocket
+  // multiplexado), entregando eventos nomeados:
+  //   - new-message-whatsapp       (INSERT, from_me=false)
+  //   - new-agent-message-whatsapp (INSERT, from_me=true)
+  //   - message-update-whatsapp    (UPDATE: status, reacoes)
+  //   - chat-upsert-whatsapp       (INSERT/UPDATE em whatsapp_chats)
+  //   - chat-delete-whatsapp       (DELETE em whatsapp_chats)
+  //
+  // O hook usa internamente o postgres_changes do Supabase com o canal
+  // protegido por RLS (a publicacao supabase_realtime ja inclui as duas
+  // tabelas) e mantem os handlers via ref — handlers passados aqui sao
+  // sempre os mais recentes, sem re-subscrever o canal.
+  useWhatsAppEvents(companyId, {
+    onChatUpsert: (next) => {
+      setChats((prev) => {
+        const idx = prev.findIndex((c) => c.id === next.id);
+        if (idx !== -1) {
+          const copy = [...prev];
+          copy[idx] = next;
+          copy.sort(compareChatsDesc);
+          return copy;
         }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "whatsapp_messages",
-        },
-        (payload) => {
-          const next = payload.new as WhatsAppMessage | null;
-          if (!next) return;
-          if (next.company_id !== companyId) return;
-          // Usa ref para sempre ler o activeChatId atual; o canal nao re-subscreve
-          // ao trocar de conversa, evitando perder mensagens em transito.
-          if (next.chat_id === activeChatIdRef.current) {
-            setMessages((prev) => upsertMessage(prev, next));
-            return;
-          }
-          // Mensagem chegou em chat diferente do ativo: se for IN, mostra
-          // um toast discreto para o operador notar a notificacao mesmo
-          // sem olhar a lista lateral. Eventos OUT (envio do proprio CRM
-          // para outro chat, ou eco do celular) nao geram toast.
-          if (payload.eventType !== "INSERT") return;
-          if (next.from_me) return;
-          const chatRef = chatsRef.current.find((c) => c.id === next.chat_id);
-          const chatLabel =
-            chatRef?.name ?? chatRef?.remote_jid?.replace(/@.*$/, "") ?? "Nova mensagem";
-          const previewBody =
-            next.body && next.body.trim().length > 0
-              ? next.body
-              : next.media_type !== "text"
-                ? `[${next.media_type}]`
-                : "(sem conteudo)";
-          setIncomingToast({
-            chatId: next.chat_id,
-            chatLabel,
-            preview: previewBody.slice(0, 120),
-          });
-          if (incomingToastTimerRef.current) {
-            clearTimeout(incomingToastTimerRef.current);
-          }
-          incomingToastTimerRef.current = setTimeout(() => {
-            setIncomingToast(null);
-            incomingToastTimerRef.current = null;
-          }, 4000);
-        }
-      )
-      .subscribe((status) => {
-        if (process.env.NODE_ENV === "development") {
-          console.debug(`[realtime] channel ${channelName} status:`, status);
-        }
+        // Chat novo nao estava na pagina atual. So adiciona se couber no
+        // recorte renderizado (last_message_at acima do mais antigo
+        // visivel) ou se nao houver mais paginas restantes — caso contrario
+        // o operador veria um chat "saltar" para o meio da lista paginada.
+        const lastVisible = prev[prev.length - 1];
+        const lastTs = lastVisible?.last_message_at ?? null;
+        const nextTs = next.last_message_at ?? null;
+        const stillHasMore = hasMoreRef.current;
+        const fitsInPage =
+          !stillHasMore ||
+          (nextTs != null && (lastTs == null || nextTs > lastTs));
+        if (!fitsInPage) return prev;
+        return [...prev, next].sort(compareChatsDesc);
       });
+    },
+    onChatDelete: (old) => {
+      setChats((prev) => prev.filter((c) => c.id !== old.id));
+    },
+    onNewMessage: (next) => {
+      // Chat ativo: anexa mensagem ao painel; o useLayoutEffect[messages]
+      // cuida do auto-scroll respeitando a heuristica de "perto do fim".
+      if (next.chat_id === activeChatIdRef.current) {
+        setMessages((prev) => upsertMessage(prev, next));
+        return;
+      }
+      // Chat nao-ativo: toast discreto para o operador notar mesmo sem
+      // olhar a lista lateral. So mensagens IN (from_me=false) chegam
+      // aqui — `new-agent-message-whatsapp` nunca gera toast por
+      // contrato do hub.
+      const chatRef = chatsRef.current.find((c) => c.id === next.chat_id);
+      const chatLabel =
+        chatRef?.name ??
+        chatRef?.remote_jid?.replace(/@.*$/, "") ??
+        "Nova mensagem";
+      const previewBody =
+        next.body && next.body.trim().length > 0
+          ? next.body
+          : next.media_type !== "text"
+            ? `[${next.media_type}]`
+            : "(sem conteudo)";
+      setIncomingToast({
+        chatId: next.chat_id,
+        chatLabel,
+        preview: previewBody.slice(0, 120),
+      });
+      if (incomingToastTimerRef.current) {
+        clearTimeout(incomingToastTimerRef.current);
+      }
+      incomingToastTimerRef.current = setTimeout(() => {
+        setIncomingToast(null);
+        incomingToastTimerRef.current = null;
+      }, 4000);
+    },
+    onNewAgentMessage: (next) => {
+      // Mensagem enviada pelo CRM (ou eco do celular do operador). Apenas
+      // upserta no painel do chat ativo — chats nao-ativos nao geram toast
+      // porque o proprio operador disparou. O state da lista lateral
+      // (last_message_preview, unread) ja vem via `onChatUpsert`.
+      if (next.chat_id === activeChatIdRef.current) {
+        setMessages((prev) => upsertMessage(prev, next));
+      }
+    },
+    onMessageUpdate: (next) => {
+      // UPDATE de status (sent/delivered/read), reacoes, etc. Sem toast.
+      if (next.chat_id === activeChatIdRef.current) {
+        setMessages((prev) => upsertMessage(prev, next));
+      }
+    },
+    onChannelStatus: (status) => {
+      if (process.env.NODE_ENV === "development") {
+        console.debug("[wa-events] channel status:", status);
+      }
+    },
+  });
 
+  // Cleanup do timer do toast quando o componente desmonta. O `useWhatsAppEvents`
+  // cuida do seu proprio canal — este effect existe so para o timer local.
+  useEffect(() => {
     return () => {
-      supabase.removeChannel(channel);
       if (incomingToastTimerRef.current) {
         clearTimeout(incomingToastTimerRef.current);
         incomingToastTimerRef.current = null;
       }
     };
-  }, [companyId]);
+  }, []);
+
+  // Saude conjunta de webhook + Realtime. Quando saudavel, o tick de
+  // polling abaixo reduz a frequencia e desliga o pull a Evolution —
+  // matando o ruido visto no DevTools sem perder a rede de seguranca
+  // (qualquer regressao de saude reativa o polling antigo).
+  const { healthy } = useWhatsAppHealth(companyId);
+  const healthyRef = useRef(healthy);
+  useEffect(() => {
+    healthyRef.current = healthy;
+  }, [healthy]);
 
   // Polling de seguranca: a cada 10s sincroniza o que esta no banco (lista
   // de chats e mensagens do chat ativo) e, em paralelo, a cada
@@ -708,19 +957,56 @@ export function ConversasContent({
       }
     }
 
-    function tick() {
-      if (document.hidden) return;
+    // Polling adaptativo guiado pela saude do hub (`useWhatsAppHealth`):
+    //
+    // - Quando NAO saudavel (webhook sem heartbeat fresco OU canal Realtime
+    //   instavel): tick rapido a cada 10s + fetch a Evolution como fallback.
+    //   E exatamente o comportamento que existia antes da otimizacao — a
+    //   rede de seguranca classica para ambientes onde o webhook nao chega
+    //   (localhost em dev sem tunnel, p.ex.).
+    //
+    // - Quando saudavel: tick reduzido para 60s, sem fetch a Evolution
+    //   (webhook + Realtime ja entregam tudo). O sync esporadico de 60s
+    //   continua como defesa contra regressao silenciosa (ex: INSERT que
+    //   por algum motivo nao chegou pelo Realtime). E o que faz o ruido
+    //   sumir do DevTools sem abrir mao de robustez.
+    //
+    // O `setInterval` continua rodando a cada 10s (granularidade) e quem
+    // decide se executa o trabalho e o proprio `tick`, lendo `healthyRef`
+    // — assim a transicao saudavel <-> nao-saudavel e instantanea sem
+    // re-criar o interval.
+    const POLL_GRANULARITY_MS = 10_000;
+    const POLL_HEALTHY_INTERVAL_MS = 60_000;
+    let lastFullTickAt = 0;
+
+    function runFullSync(includeEvolutionPull: boolean) {
       void syncActiveChat();
       void syncChatList();
-      void pullEvolutionForActive(false);
+      if (includeEvolutionPull) {
+        void pullEvolutionForActive(false);
+      }
     }
 
-    const interval = setInterval(tick, 10000);
+    function tick() {
+      if (document.hidden) return;
+      const isHealthy = healthyRef.current;
+      const now = Date.now();
+      if (isHealthy && now - lastFullTickAt < POLL_HEALTHY_INTERVAL_MS) {
+        return;
+      }
+      lastFullTickAt = now;
+      runFullSync(!isHealthy);
+    }
+
+    const interval = setInterval(tick, POLL_GRANULARITY_MS);
 
     function onVisibility() {
       if (!document.hidden) {
-        // Forca um sync imediato quando a aba volta ao foco. Evolution e
-        // marcada com forceFresh para nao depender do timer de 30s.
+        // Aba voltando ao foco: sempre roda um sync completo imediato
+        // independente da saude. Vale o custo: o operador pode ter saido
+        // por minutos/horas e merece ver o estado fresco assim que volta.
+        // Evolution e marcada com forceFresh para ignorar o cooldown.
+        lastFullTickAt = Date.now();
         void syncActiveChat();
         void syncChatList();
         void pullEvolutionForActive(true);
@@ -826,6 +1112,174 @@ export function ConversasContent({
     setReplyingTo(null);
   }
 
+  // Inicia edicao de uma mensagem propria. Pre-preenche o draft com o
+  // texto atual para que o operador edite incrementalmente em vez de
+  // digitar tudo de novo. Cancela qualquer reply ativo (ambos competem
+  // pelo mesmo input/botao Enviar). O foco do textarea e dado pelo
+  // proprio re-render — o textarea ja existe e seu value muda.
+  function startEdit(message: WhatsAppMessage) {
+    if (!canEditMessageNow(message)) return;
+    setReplyingTo(null);
+    setEditingMessage({
+      messageId: message.id,
+      originalBody: message.body ?? "",
+    });
+    setDraft(message.body ?? "");
+    setSendError(null);
+  }
+
+  // Cancela a edicao em andamento. Restaura o draft para vazio (alternativa
+  // seria preservar o que o operador estava digitando, mas isso geraria
+  // confusao: o operador nao saberia se o texto seria enviado como nova
+  // mensagem ou descartado). Vazio = decisao explicita "nao quero editar
+  // nem enviar agora".
+  function cancelEdit() {
+    setEditingMessage(null);
+    setDraft("");
+  }
+
+  // Submete a edicao para o backend. Atualizacao otimista: aplica o novo
+  // body, marca `edited_at = now`, incrementa `edit_count` localmente
+  // antes mesmo da resposta da API — assim o operador ve o efeito
+  // imediatamente. Em erro, faz rollback completo do snapshot anterior.
+  //
+  // O webhook de `messages.edited` (ou `messages.update` com edicao)
+  // chega depois e bate na mesma linha via Realtime; como o `body` ja
+  // estara igual e `upsertMessage` faz merge, o estado final e idempotente.
+  async function submitEdit() {
+    const target = editingMessage;
+    if (!target) return;
+    const newBody = draft.trim();
+    if (!newBody) {
+      setSendError("Digite um novo texto para a edicao.");
+      return;
+    }
+    if (newBody === target.originalBody.trim()) {
+      // Nada a fazer: o texto nao mudou. Simplesmente cancela o modo
+      // edicao em vez de mostrar erro — operador provavelmente apertou
+      // Enter por reflexo sem mudar nada.
+      cancelEdit();
+      return;
+    }
+    const messageBefore = messages.find((m) => m.id === target.messageId);
+    if (!messageBefore) {
+      setSendError("Mensagem nao encontrada para editar.");
+      cancelEdit();
+      return;
+    }
+    if (!canEditMessageNow(messageBefore)) {
+      setSendError(
+        "Esta mensagem nao pode mais ser editada (limite de 15 minutos do WhatsApp)."
+      );
+      cancelEdit();
+      return;
+    }
+
+    // Snapshot para rollback em caso de erro. Usamos TODAS as colunas que
+    // a edicao otimista mexe; o resto da mensagem (reactions, status, etc)
+    // e preservado pelo spread.
+    const snapshot = {
+      body: messageBefore.body,
+      edited_at: messageBefore.edited_at,
+      original_body: messageBefore.original_body,
+      edit_count: messageBefore.edit_count,
+    };
+    // Snapshot do preview da lista lateral, para rollback caso a edicao
+    // falhe e ja tivermos atualizado a previa otimisticamente.
+    const chatBefore = chats.find((c) => c.id === messageBefore.chat_id);
+    const previewSnapshot = chatBefore?.last_message_preview ?? null;
+
+    // Otimismo: atualiza local imediatamente.
+    const nowIso = new Date().toISOString();
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === target.messageId
+          ? {
+              ...m,
+              body: newBody,
+              edited_at: nowIso,
+              original_body: m.original_body ?? m.body,
+              edit_count: (m.edit_count ?? 0) + 1,
+            }
+          : m
+      )
+    );
+    // Se esta mensagem e a mais recente do chat ativo, atualiza tambem
+    // a previa local da lista lateral (o servidor faz o mesmo no `edit`
+    // route; aqui e so para o sidebar nao mostrar o texto antigo entre
+    // o click em Salvar e a chegada do realtime).
+    {
+      const messagesInChat = messages.filter(
+        (m) => m.chat_id === messageBefore.chat_id
+      );
+      const latestInChat = messagesInChat[messagesInChat.length - 1];
+      if (latestInChat?.id === target.messageId) {
+        const newPreview = newBody.slice(0, 120);
+        setChats((prev) =>
+          prev.map((c) =>
+            c.id === messageBefore.chat_id
+              ? { ...c, last_message_preview: newPreview }
+              : c
+          )
+        );
+      }
+    }
+    setEditingMessage(null);
+    setDraft("");
+    setEditing(true);
+    setSendError(null);
+
+    try {
+      const res = await fetch(
+        `/api/whatsapp/messages/${target.messageId}/edit`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: newBody }),
+        }
+      );
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        // Rollback: restaura o snapshot. Realtime/load-history ainda
+        // pode sobrescrever depois caso o servidor tenha aplicado mas
+        // a resposta tenha falhado — aceitavel (o estado final converge).
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === target.messageId ? { ...m, ...snapshot } : m
+          )
+        );
+        setChats((prev) =>
+          prev.map((c) =>
+            c.id === messageBefore.chat_id
+              ? { ...c, last_message_preview: previewSnapshot }
+              : c
+          )
+        );
+        setSendError(payload.error ?? "Falha ao editar mensagem.");
+      }
+    } catch (err) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === target.messageId ? { ...m, ...snapshot } : m
+        )
+      );
+      setChats((prev) =>
+        prev.map((c) =>
+          c.id === messageBefore.chat_id
+            ? { ...c, last_message_preview: previewSnapshot }
+            : c
+        )
+      );
+      setSendError(
+        err instanceof Error ? err.message : "Erro de rede ao editar."
+      );
+    } finally {
+      setEditing(false);
+    }
+  }
+
   // Aplica/remove reacao do operador a uma mensagem. Atualizacao otimista:
   // mexe no array `reactions` local imediatamente para o operador ver o
   // emoji aparecer/sumir, e em paralelo bate na rota que chama a Evolution.
@@ -917,6 +1371,13 @@ export function ConversasContent({
 
   function handleSend(e?: FormEvent) {
     e?.preventDefault();
+    // Modo edicao: o submit do formulario / Enter dispara submitEdit em
+    // vez de criar mensagem nova. Mantem a UX consistente: o operador
+    // sempre confirma com Enter, independente do modo do input.
+    if (editingMessage) {
+      void submitEdit();
+      return;
+    }
     const text = draft.trim();
     if (!text || !activeChat) return;
     const chatIdAtSend = activeChat.id;
@@ -948,6 +1409,9 @@ export function ConversasContent({
       quoted_body: replySnapshot ? replySnapshot.body.slice(0, 240) : null,
       quoted_from_me: replySnapshot ? replySnapshot.fromMe : null,
       reactions: [],
+      edited_at: null,
+      original_body: null,
+      edit_count: 0,
       created_at: nowIso,
     };
     setMessages((prev) => [...prev, optimistic]);
@@ -1032,15 +1496,232 @@ export function ConversasContent({
     sendQueueRef.current = thisSend;
   }
 
+  // Detecta o tipo de midia para a mensagem otimista. Mesmo criterio do
+  // servidor (`detectMediaType` em send-media/route.ts): image/* -> image,
+  // video/* -> video, resto -> document. Mantido em paralelo aqui de proposito
+  // — a UI nao tem acesso ao codigo do server.
+  function detectClientMediaType(
+    file: File
+  ): "image" | "video" | "document" {
+    const t = file.type || "";
+    if (t.startsWith("image/")) return "image";
+    if (t.startsWith("video/")) return "video";
+    return "document";
+  }
+
+  // Envia midia via multipart/form-data. Encadeia na mesma sendQueueRef do
+  // envio de texto para preservar ordem cronologica no WhatsApp do contato
+  // (3 imagens + 1 texto enviados em rajada chegam na ordem disparada).
+  function handleSendMedia(file: File, caption: string) {
+    if (!activeChat) return;
+    const chatIdAtSend = activeChat.id;
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const nowIso = new Date().toISOString();
+    const replySnapshot = replyingTo;
+    const mediaType = detectClientMediaType(file);
+    const objectURL = URL.createObjectURL(file);
+
+    // Mensagem otimista: aparece imediatamente com thumbnail local. Substituida
+    // pelo registro real quando o servidor responde (via id real + realtime).
+    const optimistic: WhatsAppMessage = {
+      id: tempId,
+      company_id: companyId,
+      chat_id: chatIdAtSend,
+      evolution_message_id: null,
+      direction: "out",
+      from_me: true,
+      body: caption.trim() || null,
+      media_type: mediaType,
+      media_url: null,
+      media_mime_type: file.type || null,
+      status: "pending",
+      error_message: null,
+      sent_at: null,
+      received_at: null,
+      sender_user_id: null,
+      quoted_evolution_message_id: null,
+      quoted_body: replySnapshot ? replySnapshot.body.slice(0, 240) : null,
+      quoted_from_me: replySnapshot ? replySnapshot.fromMe : null,
+      reactions: [],
+      edited_at: null,
+      original_body: null,
+      edit_count: 0,
+      created_at: nowIso,
+    };
+    setMessages((prev) => [...prev, optimistic]);
+    setTempMediaPreviews((prev) => {
+      const next = new Map(prev);
+      next.set(tempId, objectURL);
+      return next;
+    });
+    setSendError(null);
+    setReplyingTo(null);
+
+    const wasQueueEmpty = pendingSendsRef.current === 0;
+    pendingSendsRef.current += 1;
+    setSending(true);
+
+    const previousQueue = sendQueueRef.current;
+    const thisSend = (async () => {
+      try {
+        await previousQueue;
+      } catch {
+        // Erros do envio anterior nao impedem o proximo de tentar.
+      }
+      if (!wasQueueEmpty) {
+        await sleep(randInt(JITTER_MIN_MS, JITTER_MAX_MS));
+      }
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("chatId", chatIdAtSend);
+        if (caption.trim()) formData.append("caption", caption.trim());
+        if (replySnapshot?.messageId) {
+          formData.append("replyToMessageId", replySnapshot.messageId);
+        }
+        const res = await fetch("/api/whatsapp/messages/send-media", {
+          method: "POST",
+          body: formData,
+        });
+        if (!res.ok) {
+          const payload = (await res.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          setSendError(payload.error ?? "Falha ao enviar midia.");
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempId
+                ? {
+                    ...m,
+                    status: "failed",
+                    error_message: payload.error ?? "Falha",
+                  }
+                : m
+            )
+          );
+          return;
+        }
+        const payload = (await res.json().catch(() => ({}))) as {
+          messageId?: string;
+        };
+        if (payload.messageId) {
+          const realId = payload.messageId;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempId
+                ? {
+                    ...m,
+                    id: realId,
+                    status: "sent",
+                    sent_at: new Date().toISOString(),
+                  }
+                : m
+            )
+          );
+          // Move o objectURL para o id real ate o realtime entregar a linha
+          // do banco (que tem media_url canonico). Sem isso, ao trocar o id,
+          // o lookup do tempMediaPreviews falharia e a bolha pisca um
+          // fallback `[imagem]` ate a rota /media responder.
+          setTempMediaPreviews((prev) => {
+            const next = new Map(prev);
+            const url = next.get(tempId);
+            if (url) {
+              next.delete(tempId);
+              next.set(realId, url);
+            }
+            return next;
+          });
+          // Revoga depois de 30s — tempo suficiente para o realtime entregar
+          // o registro real e o navegador comecar a cachear /media. Se manter,
+          // ocupa memoria indefinidamente.
+          setTimeout(() => {
+            URL.revokeObjectURL(objectURL);
+            setTempMediaPreviews((prev) => {
+              if (!prev.has(realId)) return prev;
+              const next = new Map(prev);
+              next.delete(realId);
+              return next;
+            });
+          }, 30_000);
+        } else {
+          URL.revokeObjectURL(objectURL);
+        }
+      } catch (err) {
+        setSendError(err instanceof Error ? err.message : "Falha ao enviar midia.");
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempId
+              ? { ...m, status: "failed", error_message: "Erro de rede" }
+              : m
+          )
+        );
+        URL.revokeObjectURL(objectURL);
+      } finally {
+        pendingSendsRef.current = Math.max(0, pendingSendsRef.current - 1);
+        if (pendingSendsRef.current === 0) {
+          setSending(false);
+        }
+      }
+    })();
+    sendQueueRef.current = thisSend;
+  }
+
+  // Click no clipe abre o picker nativo do navegador. Reset do value antes
+  // de abrir permite selecionar o MESMO arquivo de novo (caso o operador
+  // cancele o preview e queira reabrir o mesmo arquivo).
+  function handlePickFile() {
+    if (!fileInputRef.current) return;
+    fileInputRef.current.value = "";
+    fileInputRef.current.click();
+  }
+
+  // Validacao client de tamanho: 4MB. O servidor revalida (defesa em
+  // profundidade) mas falhar cedo no client poupa upload inutil.
+  const MAX_CLIENT_FILE_BYTES = 4 * 1024 * 1024;
+
+  function handleFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] ?? null;
+    if (!file) return;
+    if (file.size > MAX_CLIENT_FILE_BYTES) {
+      setSendError(
+        `Arquivo muito grande. Limite: ${Math.floor(
+          MAX_CLIENT_FILE_BYTES / (1024 * 1024)
+        )} MB.`
+      );
+      return;
+    }
+    setSendError(null);
+    setPendingMediaFile(file);
+  }
+
+  // Limpa objectURLs ainda em memoria ao desmontar (ex: usuario navega para
+  // fora de /conversas). Usa a ref espelho para pegar o estado mais recente:
+  // se usasse o state direto, capturaria o map inicial (vazio) por causa
+  // do array de deps `[]`.
+  useEffect(() => {
+    return () => {
+      tempMediaPreviewsRef.current.forEach((url) =>
+        URL.revokeObjectURL(url)
+      );
+    };
+  }, []);
+
   function handleKey(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
       return;
     }
-    if (e.key === "Escape" && replyingTo) {
-      e.preventDefault();
-      cancelReply();
+    if (e.key === "Escape") {
+      if (editingMessage) {
+        e.preventDefault();
+        cancelEdit();
+        return;
+      }
+      if (replyingTo) {
+        e.preventDefault();
+        cancelReply();
+      }
     }
   }
 
@@ -1062,6 +1743,41 @@ export function ConversasContent({
       .from("whatsapp_chats")
       .update({ lead_id: null })
       .eq("id", activeChat.id);
+  }
+
+  // Renomeia o contato (`whatsapp_chats.name`). Aceita `null`/string vazia
+  // como "limpar nome" — a UI vai cair no fallback do telefone formatado.
+  // Otimista: atualiza o `chats` local imediatamente; rollback em erro
+  // restaura o nome anterior. RLS do Supabase ja garante que so usuarios
+  // da mesma `company_id` conseguem fazer o UPDATE.
+  async function renameChat(newName: string | null): Promise<{
+    ok: boolean;
+    error?: string;
+  }> {
+    if (!activeChat) return { ok: false, error: "Nenhum chat ativo." };
+    const previousName = activeChat.name;
+    const trimmed =
+      typeof newName === "string" ? newName.trim() : null;
+    const finalName = trimmed && trimmed.length > 0 ? trimmed : null;
+    setChats((prev) =>
+      prev.map((c) =>
+        c.id === activeChat.id ? { ...c, name: finalName } : c
+      )
+    );
+    const supabase = createClient();
+    const { error } = await supabase
+      .from("whatsapp_chats")
+      .update({ name: finalName })
+      .eq("id", activeChat.id);
+    if (error) {
+      setChats((prev) =>
+        prev.map((c) =>
+          c.id === activeChat.id ? { ...c, name: previousName } : c
+        )
+      );
+      return { ok: false, error: error.message };
+    }
+    return { ok: true };
   }
 
   // Refresh manual: pede a Evolution as ultimas mensagens do chat ativo e
@@ -1266,13 +1982,27 @@ export function ConversasContent({
                       </div>
                       <div className="flex items-center justify-between gap-2">
                         <p
-                          className={`truncate text-xs ${
+                          className={`flex min-w-0 items-center gap-1 truncate text-xs ${
                             hasUnread
                               ? "font-medium text-gray-700"
                               : "text-gray-500"
                           }`}
                         >
-                          {c.last_message_preview ?? "—"}
+                          {/* Checks de WhatsApp na previa, igual o app
+                              oficial: so quando a ultima mensagem foi
+                              enviada por mim (operador). Se foi do
+                              contato, a previa fica so com o texto. */}
+                          {c.last_message_from_me && c.last_message_status && (
+                            <span className="shrink-0">
+                              <MessageStatusChecks
+                                status={c.last_message_status}
+                                size={12}
+                              />
+                            </span>
+                          )}
+                          <span className="truncate">
+                            {c.last_message_preview ?? "—"}
+                          </span>
                         </p>
                         {hasUnread && (
                           <span
@@ -1452,6 +2182,7 @@ export function ConversasContent({
                         onReply={startReply}
                         onJumpToQuote={jumpToQuote}
                         onReact={reactToMessage}
+                        onEdit={startEdit}
                         onOpenMedia={(kind, id) =>
                           setLightbox({ kind, messageId: id })
                         }
@@ -1460,6 +2191,7 @@ export function ConversasContent({
                           activeChat?.name ??
                           jidToPhoneDisplay(activeChat?.remote_jid ?? "")
                         }
+                        tempPreviewUrl={tempMediaPreviews.get(m.id) ?? null}
                       />
                     ))}
                   </div>
@@ -1476,7 +2208,7 @@ export function ConversasContent({
                   {sendError}
                 </div>
               )}
-              {replyingTo && (
+              {replyingTo && !editingMessage && (
                 <div className="flex items-stretch gap-3 border-t border-gray-200 bg-gray-50 px-4 py-2">
                   <div
                     className={`w-1 shrink-0 rounded-full ${
@@ -1520,29 +2252,138 @@ export function ConversasContent({
                   </button>
                 </div>
               )}
+              {editingMessage && (
+                <div className="flex items-stretch gap-3 border-t border-amber-200 bg-amber-50 px-4 py-2">
+                  <div
+                    className="w-1 shrink-0 rounded-full bg-amber-500"
+                    aria-hidden
+                  />
+                  <div className="min-w-0 flex-1 py-1">
+                    <p className="flex items-center gap-1 truncate text-[11px] font-semibold text-amber-800">
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden
+                      >
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                      </svg>
+                      Editando mensagem
+                      <span className="font-normal text-amber-600">
+                        (Esc para cancelar)
+                      </span>
+                    </p>
+                    <p className="mt-0.5 truncate text-xs text-gray-600">
+                      Original: {editingMessage.originalBody || "(vazio)"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={cancelEdit}
+                    className="shrink-0 self-start rounded-full p-1 text-amber-600 hover:bg-amber-100 hover:text-amber-900"
+                    aria-label="Cancelar edicao"
+                    title="Cancelar edicao (Esc)"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                </div>
+              )}
               <form
                 onSubmit={handleSend}
                 className="flex items-end gap-2 border-t border-gray-200 bg-white px-4 py-3"
               >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*,video/*,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/zip,text/plain,text/csv"
+                  className="hidden"
+                  onChange={handleFileSelected}
+                />
+                <button
+                  type="button"
+                  onClick={handlePickFile}
+                  aria-label="Anexar arquivo"
+                  title={
+                    editingMessage
+                      ? "Anexar arquivo (indisponivel em modo edicao)"
+                      : "Anexar foto, video ou documento"
+                  }
+                  disabled={Boolean(editingMessage)}
+                  className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-gray-500 transition-colors hover:bg-gray-100 hover:text-emerald-600 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-gray-500"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="20"
+                    height="20"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                  </svg>
+                </button>
                 <textarea
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={handleKey}
-                  placeholder="Digite uma mensagem... (Enter para enviar, Shift+Enter para nova linha)"
+                  placeholder={
+                    editingMessage
+                      ? "Edite a mensagem... (Enter salva, Esc cancela)"
+                      : "Digite uma mensagem... (Enter para enviar, Shift+Enter para nova linha)"
+                  }
                   rows={2}
-                  className="flex-1 resize-none rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  className={`flex-1 resize-none rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 ${
+                    editingMessage
+                      ? "border-amber-300 bg-amber-50/30 focus:border-amber-500 focus:ring-amber-500/20"
+                      : "border-gray-200 focus:border-blue-500 focus:ring-blue-500/20"
+                  }`}
                 />
                 <button
                   type="submit"
-                  disabled={!draft.trim()}
-                  className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
+                  disabled={
+                    !draft.trim() ||
+                    editing ||
+                    (Boolean(editingMessage) &&
+                      draft.trim() ===
+                        (editingMessage?.originalBody ?? "").trim())
+                  }
+                  className={`rounded-lg px-4 py-2 text-sm font-medium text-white shadow-sm disabled:opacity-50 ${
+                    editingMessage
+                      ? "bg-amber-600 hover:bg-amber-700"
+                      : "bg-emerald-600 hover:bg-emerald-700"
+                  }`}
                   title={
-                    sending
-                      ? "Enviando mensagens anteriores em ordem..."
-                      : undefined
+                    editingMessage
+                      ? "Salvar edicao"
+                      : sending
+                        ? "Enviando mensagens anteriores em ordem..."
+                        : undefined
                   }
                 >
-                  Enviar
+                  {editingMessage ? (editing ? "Salvando..." : "Salvar") : "Enviar"}
                 </button>
               </form>
             </>
@@ -1560,6 +2401,18 @@ export function ConversasContent({
         <DocumentLightbox
           messageId={lightbox.messageId}
           onClose={() => setLightbox(null)}
+        />
+      )}
+
+      {pendingMediaFile && (
+        <MediaPreviewDialog
+          file={pendingMediaFile}
+          onCancel={() => setPendingMediaFile(null)}
+          onConfirm={(caption) => {
+            const file = pendingMediaFile;
+            setPendingMediaFile(null);
+            handleSendMedia(file, caption);
+          }}
         />
       )}
 
@@ -1616,6 +2469,7 @@ export function ConversasContent({
             setShowLinkLead(true);
           }}
           onUnlinkLead={unlinkLead}
+          onRename={renameChat}
         />
       )}
 
@@ -1739,6 +2593,13 @@ interface ContactPanelProps {
   onClose: () => void;
   onLinkLead: () => void;
   onUnlinkLead: () => void;
+  /**
+   * Persiste o nome do contato em `whatsapp_chats.name`. Aceita string
+   * vazia/`null` para "limpar nome" (UI cai no fallback do telefone).
+   * Resolve com `{ ok, error? }` — o painel exibe o erro inline em vez
+   * de descartar a edicao.
+   */
+  onRename: (newName: string | null) => Promise<{ ok: boolean; error?: string }>;
 }
 
 function ContactPanel({
@@ -1748,11 +2609,91 @@ function ContactPanel({
   onClose,
   onLinkLead,
   onUnlinkLead,
+  onRename,
 }: ContactPanelProps) {
   const phone = chat.remote_jid.replace(/@.*$/, "");
   const phoneDisplay = jidToPhoneDisplay(chat.remote_jid);
   const displayName = chat.name || phoneDisplay;
   const waLink = `https://wa.me/${phone}`;
+
+  // Estado do modo edicao do nome. Inicia oculto; click no lapis abre o
+  // input pre-preenchido com o nome atual (ou vazio se ainda nao tem).
+  // Submit bate em `onRename` (que ja faz UPDATE otimista no chats array
+  // do componente pai). Em caso de erro do banco, mostramos inline e
+  // mantemos o modo edicao para o operador tentar novo valor.
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(chat.name ?? "");
+  const [savingName, setSavingName] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Quando troca de chat (props.chat.id muda) com o painel aberto,
+  // sai do modo edicao e re-sincroniza o draft. Sem isso, o draft do
+  // contato anterior seria salvo no contato novo se o operador clicar
+  // em "Salvar" sem prestar atencao.
+  useEffect(() => {
+    setEditingName(false);
+    setNameDraft(chat.name ?? "");
+    setNameError(null);
+  }, [chat.id, chat.name]);
+
+  // Foca o input no momento que entra em modo edicao (proxima frame).
+  useEffect(() => {
+    if (editingName) {
+      const id = window.requestAnimationFrame(() => {
+        nameInputRef.current?.focus();
+        nameInputRef.current?.select();
+      });
+      return () => window.cancelAnimationFrame(id);
+    }
+  }, [editingName]);
+
+  function startEditName() {
+    setNameDraft(chat.name ?? "");
+    setNameError(null);
+    setEditingName(true);
+  }
+
+  function cancelEditName() {
+    setEditingName(false);
+    setNameDraft(chat.name ?? "");
+    setNameError(null);
+  }
+
+  // Atalho: usar o nome do lead vinculado como nome do contato. So
+  // disponivel quando `chat.lead_id` e `linkedLeadName` estao presentes.
+  // Apenas pre-preenche o draft — o operador ainda confirma com Salvar.
+  function fillFromLead() {
+    if (linkedLeadName) {
+      setNameDraft(linkedLeadName);
+      setNameError(null);
+    }
+  }
+
+  async function saveName() {
+    if (savingName) return;
+    setSavingName(true);
+    setNameError(null);
+    const result = await onRename(nameDraft);
+    setSavingName(false);
+    if (!result.ok) {
+      setNameError(result.error ?? "Falha ao salvar nome.");
+      return;
+    }
+    setEditingName(false);
+  }
+
+  function handleNameKey(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void saveName();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEditName();
+    }
+  }
 
   return (
     <div
@@ -1805,10 +2746,104 @@ function ContactPanel({
               hasLead={Boolean(chat.lead_id)}
               size={120}
             />
-            <div className="text-center">
-              <p className="text-lg font-semibold text-gray-900">
-                {displayName}
-              </p>
+            <div className="w-full text-center">
+              {editingName ? (
+                <div className="flex flex-col items-center gap-2 px-2">
+                  <input
+                    ref={nameInputRef}
+                    type="text"
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={handleNameKey}
+                    placeholder={phoneDisplay}
+                    maxLength={120}
+                    disabled={savingName}
+                    aria-label="Nome do contato"
+                    className="w-full max-w-xs rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-center text-base font-semibold text-gray-900 shadow-sm focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 disabled:opacity-60"
+                  />
+                  {chat.lead_id && linkedLeadName && (
+                    <button
+                      type="button"
+                      onClick={fillFromLead}
+                      disabled={savingName || nameDraft === linkedLeadName}
+                      className="inline-flex items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                      title="Preencher com o nome do lead vinculado"
+                    >
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="11"
+                        height="11"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden
+                      >
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                      Usar nome do lead ({linkedLeadName})
+                    </button>
+                  )}
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={cancelEditName}
+                      disabled={savingName}
+                      className="rounded-md border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveName}
+                      disabled={
+                        savingName ||
+                        nameDraft.trim() === (chat.name ?? "").trim()
+                      }
+                      className="rounded-md bg-emerald-600 px-3 py-1 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
+                    >
+                      {savingName ? "Salvando..." : "Salvar"}
+                    </button>
+                  </div>
+                  {nameError && (
+                    <p className="text-[11px] text-red-600">{nameError}</p>
+                  )}
+                  <p className="text-[10px] text-gray-400">
+                    Enter salva, Esc cancela. Vazio = usar telefone.
+                  </p>
+                </div>
+              ) : (
+                <div className="group/name inline-flex items-center justify-center gap-1.5">
+                  <p className="text-lg font-semibold text-gray-900">
+                    {displayName}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={startEditName}
+                    aria-label="Editar nome do contato"
+                    title="Editar nome"
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-full text-gray-400 opacity-60 transition-all hover:bg-gray-100 hover:text-emerald-600 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-emerald-400 group-hover/name:opacity-100"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                    </svg>
+                  </button>
+                </div>
+              )}
               <p className="mt-1 text-sm text-gray-500">{phoneDisplay}</p>
             </div>
             <a
@@ -1971,29 +3006,42 @@ function StickerImage({ messageId }: { messageId: string }) {
 // Imagem inline na bolha. Click abre o lightbox em tela cheia (com download
 // e fechar). Tamanho maximo permite varias imagens roladas sem dominar o
 // viewport; cursor-zoom-in indica a interacao.
+//
+// `srcOverride`: quando passado, usa essa URL em vez de chamar a rota
+// `/media`. Usado para mensagens otimistas (`temp-`) onde o operador acabou
+// de selecionar a imagem — mostra o thumbnail local (`URL.createObjectURL`)
+// imediatamente, sem precisar esperar a Evolution decodificar via rota /media.
+// Quando o id real chega via realtime, o componente e re-renderizado sem
+// override e passa a usar o caminho normal.
 function MessageImage({
   messageId,
   onOpen,
+  srcOverride,
 }: {
   messageId: string;
   onOpen: () => void;
+  srcOverride?: string | null;
 }) {
   const [errored, setErrored] = useState(false);
   if (errored) {
     return <p className="italic text-gray-500">[imagem]</p>;
   }
+  const src = srcOverride ?? mediaUrl(messageId);
   return (
     <button
       type="button"
       onClick={onOpen}
       aria-label="Abrir imagem em tela cheia"
       className="block overflow-hidden rounded-lg"
+      disabled={Boolean(srcOverride)}
     >
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
-        src={mediaUrl(messageId)}
+        src={src}
         alt="Imagem recebida"
-        className="block max-h-64 w-auto cursor-zoom-in object-cover"
+        className={`block max-h-64 w-auto object-cover ${
+          srcOverride ? "" : "cursor-zoom-in"
+        }`}
         onError={() => setErrored(true)}
       />
     </button>
@@ -2005,11 +3053,31 @@ function MessageImage({
 // e renderizado e a midia comeca a baixar (autoPlay para sequencia natural
 // do clique). Isso evita decodes/conversoes pesadas em rajada na Evolution
 // e trafego desnecessario para videos que o operador talvez nem va abrir.
-function MessageVideo({ messageId }: { messageId: string }) {
+function MessageVideo({
+  messageId,
+  srcOverride,
+}: {
+  messageId: string;
+  srcOverride?: string | null;
+}) {
   const [load, setLoad] = useState(false);
   const [errored, setErrored] = useState(false);
   if (errored) {
     return <p className="italic text-gray-500">[video]</p>;
+  }
+  // Otimista: mostra player imediato com a fonte local sem o placeholder
+  // de "Reproduzir" — o operador acabou de selecionar o arquivo, nao precisa
+  // de um intermediario.
+  if (srcOverride) {
+    return (
+      <video
+        controls
+        preload="metadata"
+        src={srcOverride}
+        onError={() => setErrored(true)}
+        className="block max-h-72 w-auto rounded-lg bg-black"
+      />
+    );
   }
   if (!load) {
     return (
@@ -2677,18 +3745,28 @@ function MessageBubble({
   onReply,
   onJumpToQuote,
   onReact,
+  onEdit,
   onOpenMedia,
   highlighted,
   contactName,
+  tempPreviewUrl,
 }: {
   message: WhatsAppMessage;
   senderName: string | null;
   onReply: (message: WhatsAppMessage) => void;
   onJumpToQuote: (quotedEvoId: string) => void;
   onReact: (messageId: string, emoji: string) => void;
+  // Inicia edicao da mensagem. So sera chamada para mensagens que passam
+  // em `canEditMessageNow` — o botao fica escondido nos demais casos.
+  onEdit: (message: WhatsAppMessage) => void;
   onOpenMedia: (kind: "image" | "document", messageId: string) => void;
   highlighted: boolean;
   contactName: string;
+  // URL local (objectURL) para mensagens otimistas (`temp-`) que tem midia.
+  // Quando passada, image/video renderizam imediatamente com a fonte local
+  // em vez de fallback `[imagem]`/`[video]`. Documento temp continua sendo
+  // texto porque a preview de PDF/DOCX no DOM seria custosa e nao agrega.
+  tempPreviewUrl?: string | null;
 }) {
   const isMe = message.from_me;
   const time = fmtTime(
@@ -2696,23 +3774,36 @@ function MessageBubble({
   );
   const isExternal = senderName === "Enviado pelo celular";
   const hasQuote = Boolean(message.quoted_body);
+  const isTemp = message.id.startsWith("temp-");
   // Mensagem otimista (temp-) ainda nao tem id real no banco; nao podemos
   // usar como replyTo porque o backend nao consegue resolver evolution_message_id.
-  const canReply = !message.id.startsWith("temp-");
+  const canReply = !isTemp;
   // Reagir tem o mesmo requisito do reply (precisa do evolution_message_id
   // resolvido no servidor) + a instancia precisa estar conectada (a rota
   // valida no servidor; aqui so habilitamos o botao para o caminho feliz).
-  const canReact =
-    !message.id.startsWith("temp-") &&
-    Boolean(message.evolution_message_id);
+  const canReact = !isTemp && Boolean(message.evolution_message_id);
+  // Edicao: so propria, so texto, so dentro da janela de 15 min do
+  // WhatsApp, e so com `evolution_message_id` resolvido. Calculado
+  // por `canEditMessageNow` (mesma regra do `submitEdit` no parent
+  // para evitar drift entre exibir/aceitar).
+  const canEdit = canEditMessageNow(message);
   // Midia so e exibivel se ja temos id real e evolution_message_id (a rota
-  // de midia precisa do evo id pra decodificar via Evolution). Mensagem
-  // temp- ou sem evoId cai no fallback textual `[image]`/`[video]`/etc.
+  // de midia precisa do evo id pra decodificar via Evolution). Excecao:
+  // mensagens otimistas com `tempPreviewUrl` (image/video) renderizam com
+  // a fonte local para feedback instantaneo no envio.
   const isPlayableMedia =
-    Boolean(message.evolution_message_id) && !message.id.startsWith("temp-");
+    Boolean(message.evolution_message_id) && !isTemp;
+  const canUseOptimisticPreview =
+    isTemp &&
+    Boolean(tempPreviewUrl) &&
+    (message.media_type === "image" || message.media_type === "video");
   const isSticker = message.media_type === "sticker" && isPlayableMedia;
-  const isImage = message.media_type === "image" && isPlayableMedia;
-  const isVideo = message.media_type === "video" && isPlayableMedia;
+  const isImage =
+    message.media_type === "image" &&
+    (isPlayableMedia || canUseOptimisticPreview);
+  const isVideo =
+    message.media_type === "video" &&
+    (isPlayableMedia || canUseOptimisticPreview);
   const isAudio = message.media_type === "audio" && isPlayableMedia;
   const isDocument = message.media_type === "document" && isPlayableMedia;
   // Bolha "naked" (sem fundo/padding) para sticker; padding compacto para
@@ -2757,6 +3848,11 @@ function MessageBubble({
   function handleReplyClick(e: React.MouseEvent) {
     e.stopPropagation();
     onReply(message);
+  }
+
+  function handleEditClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    onEdit(message);
   }
 
   function handleReactButtonClick(e: React.MouseEvent) {
@@ -2879,19 +3975,23 @@ function MessageBubble({
               <MessageImage
                 messageId={message.id}
                 onOpen={() => onOpenMedia("image", message.id)}
+                srcOverride={canUseOptimisticPreview ? tempPreviewUrl : null}
               />
               {message.body && (
                 <p className="mt-1.5 whitespace-pre-wrap break-words px-1.5 pb-0.5 [overflow-wrap:anywhere]">
-                  {message.body}
+                  {renderTextWithLinks(message.body)}
                 </p>
               )}
             </>
           ) : isVideo ? (
             <>
-              <MessageVideo messageId={message.id} />
+              <MessageVideo
+                messageId={message.id}
+                srcOverride={canUseOptimisticPreview ? tempPreviewUrl : null}
+              />
               {message.body && (
                 <p className="mt-1.5 whitespace-pre-wrap break-words px-1.5 pb-0.5 [overflow-wrap:anywhere]">
-                  {message.body}
+                  {renderTextWithLinks(message.body)}
                 </p>
               )}
             </>
@@ -2907,10 +4007,14 @@ function MessageBubble({
             />
           ) : message.body ? (
             <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-              {message.body}
+              {renderTextWithLinks(message.body)}
             </p>
           ) : message.media_type !== "text" ? (
-            <p className="italic text-gray-500">[{message.media_type}]</p>
+            <p className="italic text-gray-500">
+              {isTemp && message.media_type === "document"
+                ? "[enviando documento...]"
+                : `[${message.media_type}]`}
+            </p>
           ) : null}
           <div
             className={`flex items-center justify-end gap-1 text-[10px] text-gray-500 ${
@@ -2923,20 +4027,31 @@ function MessageBubble({
                     : "mt-1"
             }`}
           >
-            <span>{time}</span>
-            {isMe && (
-              <span aria-label={`Status: ${message.status}`}>
-                {message.status === "read"
-                  ? "lida"
-                  : message.status === "delivered"
-                    ? "entregue"
-                    : message.status === "sent"
-                      ? "enviada"
-                      : message.status === "failed"
-                        ? "falhou"
-                        : "..."}
+            {message.edited_at && (
+              <span
+                className="flex items-center gap-0.5 italic"
+                title={`Editada em ${new Date(message.edited_at).toLocaleString("pt-BR")}`}
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="9"
+                  height="9"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden
+                >
+                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                </svg>
+                editada
               </span>
             )}
+            <span>{time}</span>
+            {isMe && <MessageStatusChecks status={message.status} size={14} />}
           </div>
           {message.error_message && (
             <p className="mt-1 text-[10px] text-red-600">
@@ -2944,7 +4059,7 @@ function MessageBubble({
             </p>
           )}
         </div>
-        {(canReply || canReact) && (
+        {(canReply || canReact || canEdit) && (
           <div
             className={`mt-1 flex shrink-0 items-center gap-1 self-start ${
               isMe ? "flex-row-reverse" : "flex-row"
@@ -2971,6 +4086,31 @@ function MessageBubble({
                 >
                   <polyline points="9 17 4 12 9 7" />
                   <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+                </svg>
+              </button>
+            )}
+            {canEdit && (
+              <button
+                type="button"
+                onClick={handleEditClick}
+                aria-label="Editar mensagem"
+                title="Editar (ate 15 min apos o envio)"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-gray-500 opacity-0 shadow-sm ring-1 ring-gray-200 transition-opacity hover:bg-gray-50 hover:text-emerald-600 focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-emerald-400 group-hover/msg:opacity-100"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden
+                >
+                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                 </svg>
               </button>
             )}
@@ -3074,6 +4214,196 @@ function MessageBubble({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// Formata tamanho em bytes para humano (B / KB / MB). Usado no card de
+// documento dentro do MediaPreviewDialog para que o operador veja o "peso"
+// do arquivo antes de enviar.
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Modal de pre-visualizacao antes do envio. Estilo WhatsApp: tela inteira
+// escura, midia ao centro, campo de legenda embaixo, botoes Cancelar/Enviar.
+// Tecla Esc fecha; Enter no campo de legenda envia (Shift+Enter = nova linha).
+//
+// O `objectURL` e criado e revogado dentro deste componente — encapsulamento:
+// se o operador cancelar o preview, nenhum estado externo precisa lembrar
+// do arquivo. So quando ele clicar em "Enviar" e que a midia "vaza" para
+// o fluxo otimista do `handleSendMedia` (que cria seu proprio objectURL
+// para o thumbnail na bolha).
+function MediaPreviewDialog({
+  file,
+  onCancel,
+  onConfirm,
+  defaultCaption,
+}: {
+  file: File;
+  onCancel: () => void;
+  onConfirm: (caption: string) => void;
+  defaultCaption?: string;
+}) {
+  const [caption, setCaption] = useState(defaultCaption ?? "");
+  // objectURL local ao modal. Quando o modal desmonta (cancel ou confirm),
+  // revoga para liberar memoria. O handleSendMedia cria seu PROPRIO objectURL
+  // do mesmo File para o thumbnail otimista — sem reuso entre os dois para
+  // que cada ciclo de vida seja independente.
+  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
+  useEffect(() => {
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
+
+  useEffect(() => {
+    function onKey(e: globalThis.KeyboardEvent) {
+      if (e.key === "Escape") onCancel();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const isImage = file.type.startsWith("image/");
+  const isVideo = file.type.startsWith("video/");
+  const ext = (() => {
+    const name = file.name.toLowerCase();
+    if (name.includes(".")) {
+      const e = name.split(".").pop() ?? "";
+      if (e.length > 0 && e.length <= 5) return e.toUpperCase();
+    }
+    if (file.type) {
+      const sub = file.type.split("/")[1]?.split(";")[0] ?? "";
+      if (sub) return sub.toUpperCase();
+    }
+    return "ARQUIVO";
+  })();
+
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    onConfirm(caption);
+  }
+
+  function handleCaptionKey(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      onConfirm(caption);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-black/90"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Pre-visualizacao da midia"
+    >
+      <div className="flex items-center justify-between px-4 py-3">
+        <button
+          type="button"
+          onClick={onCancel}
+          aria-label="Cancelar"
+          title="Cancelar"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
+          </svg>
+        </button>
+        <p className="truncate px-4 text-sm text-white/80" title={file.name}>
+          {file.name}
+        </p>
+        <span className="w-9" aria-hidden />
+      </div>
+
+      <div className="flex flex-1 items-center justify-center overflow-auto px-4 py-2">
+        {isImage ? (
+          /* eslint-disable-next-line @next/next/no-img-element */
+          <img
+            src={previewUrl}
+            alt="Pre-visualizacao"
+            className="max-h-full max-w-full rounded-lg object-contain"
+          />
+        ) : isVideo ? (
+          <video
+            src={previewUrl}
+            controls
+            className="max-h-full max-w-full rounded-lg bg-black"
+          />
+        ) : (
+          <div className="flex w-full max-w-md flex-col items-center gap-3 rounded-xl bg-white/5 px-6 py-8 text-white">
+            <span className="inline-flex h-16 w-16 items-center justify-center rounded-lg bg-white/10">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="32"
+                height="32"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+            </span>
+            <p className="break-all text-center text-sm font-medium">
+              {file.name}
+            </p>
+            <p className="text-xs text-white/60">
+              {ext} - {formatFileSize(file.size)}
+            </p>
+          </div>
+        )}
+      </div>
+
+      <form
+        onSubmit={handleSubmit}
+        className="flex items-end gap-2 border-t border-white/10 bg-black/40 px-4 py-3"
+      >
+        <textarea
+          value={caption}
+          onChange={(e) => setCaption(e.target.value)}
+          onKeyDown={handleCaptionKey}
+          placeholder="Adicionar uma legenda... (opcional)"
+          rows={1}
+          className="flex-1 resize-none rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm text-white placeholder:text-white/50 focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/30"
+        />
+        <button
+          type="submit"
+          className="inline-flex h-11 items-center gap-2 rounded-full bg-emerald-600 px-5 text-sm font-medium text-white shadow-md transition-colors hover:bg-emerald-700"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M22 2 11 13" />
+            <path d="m22 2-7 20-4-9-9-4Z" />
+          </svg>
+          Enviar
+        </button>
+      </form>
     </div>
   );
 }

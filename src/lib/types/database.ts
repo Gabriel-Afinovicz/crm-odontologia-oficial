@@ -382,6 +382,13 @@ export interface WhatsAppInstance {
   // Cooldown server-side de 60s sobrevive a F5/sessao nova/multi-aba e
   // protege as chamadas mais sensiveis (whatsappNumbers em batches).
   last_manual_sync_at: string | null;
+  // Heartbeat do webhook da Evolution. Atualizado pelo proprio handler do
+  // webhook com throttle server-side de 15s (condicional no WHERE da query).
+  // O cliente (`useWhatsAppHealth`) usa para detectar que o webhook esta
+  // vivo e suspender o polling de fallback em `conversas-content`. Null
+  // significa que nenhum webhook foi recebido ainda — comportamento
+  // equivalente ao "nao confio no webhook ainda" do cliente.
+  webhook_last_seen_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -395,6 +402,22 @@ export interface WhatsAppChat {
   lead_id: string | null;
   last_message_at: string | null;
   last_message_preview: string | null;
+  /**
+   * `true` quando a ultima mensagem do chat foi enviada por mim (operador
+   * via CRM ou pelo celular do dono da instancia). `false` se foi recebida
+   * do contato. `null` apenas para chats antigos sem backfill.
+   *
+   * Usado pela UI da lista lateral para decidir se mostra os checks de
+   * WhatsApp ao lado da previa (so quando `true`, igual o app oficial).
+   */
+  last_message_from_me: boolean | null;
+  /**
+   * Status (`pending`/`sent`/`delivered`/`read`/`failed`) da ultima
+   * mensagem do chat. Significativo apenas quando `last_message_from_me`
+   * e `true`. Atualizado pelo webhook `messages.update` quando o
+   * destinatario confirma recebimento/leitura.
+   */
+  last_message_status: WhatsAppMessageStatus | null;
   unread_count: number;
   is_archived: boolean;
   profile_picture_url: string | null;
@@ -471,6 +494,13 @@ export interface WhatsAppMessage {
   // `mergeReactions` para manter no maximo 1 emoji por reator. UI agrega
   // por emoji para mostrar badges abaixo da bolha.
   reactions: WhatsAppMessageReaction[];
+  // Edicao de mensagem (Leva 3 — maio/2026). Quando a Evolution entrega
+  // MESSAGES_EDITED, o webhook atualiza `body` com o novo texto e popula
+  // estes campos. `original_body` guarda o texto antes da primeira edicao;
+  // `edit_count` conta quantas vezes a mensagem foi editada.
+  edited_at: string | null;
+  original_body: string | null;
+  edit_count: number;
   created_at: string;
 }
 
@@ -663,6 +693,7 @@ export interface Database {
           | "connected_at"
           | "last_post_login_sync_at"
           | "last_manual_sync_at"
+          | "webhook_last_seen_at"
         > &
           Partial<
             Pick<
@@ -673,6 +704,7 @@ export interface Database {
               | "connected_at"
               | "last_post_login_sync_at"
               | "last_manual_sync_at"
+              | "webhook_last_seen_at"
             >
           >;
         Update: Partial<Omit<WhatsAppInstance, "id" | "created_at">>;
@@ -726,6 +758,9 @@ export interface Database {
           | "quoted_evolution_message_id"
           | "quoted_body"
           | "quoted_from_me"
+          | "edited_at"
+          | "original_body"
+          | "edit_count"
         > &
           Partial<
             Pick<
@@ -744,6 +779,9 @@ export interface Database {
               | "quoted_evolution_message_id"
               | "quoted_body"
               | "quoted_from_me"
+              | "edited_at"
+              | "original_body"
+              | "edit_count"
             >
           >;
         Update: Partial<Omit<WhatsAppMessage, "id" | "created_at">>;

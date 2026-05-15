@@ -184,6 +184,8 @@ export async function POST(req: NextRequest) {
           lead_id: leadId,
           last_message_at: new Date().toISOString(),
           last_message_preview: text.slice(0, 120),
+          last_message_from_me: true,
+          last_message_status: "sent",
         })
         .select("id, company_id, instance_id, remote_jid, lead_id")
         .single();
@@ -357,6 +359,8 @@ export async function POST(req: NextRequest) {
     .update({
       last_message_at: sentAt,
       last_message_preview: text.slice(0, 120),
+      last_message_from_me: true,
+      last_message_status: "sent",
     })
     .eq("id", chatRow.id);
 

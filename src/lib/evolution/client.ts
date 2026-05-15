@@ -182,18 +182,19 @@ export const evolution = {
     };
     if (webhook) {
       body.webhook = {
-        enabled: true,
-        url: webhook,
-        byEvents: false,
-        base64: true,
-        events: [
-          "MESSAGES_UPSERT",
-          "MESSAGES_UPDATE",
-          "CONNECTION_UPDATE",
-          "CHATS_UPSERT",
-          "CHATS_UPDATE",
-        ],
-      };
+          enabled: true,
+          url: webhook,
+          byEvents: false,
+          base64: true,
+          events: [
+            "MESSAGES_UPSERT",
+            "MESSAGES_UPDATE",
+            "MESSAGES_EDITED",
+            "CONNECTION_UPDATE",
+            "CHATS_UPSERT",
+            "CHATS_UPDATE",
+          ],
+        };
     }
     return request<CreateInstanceResponse>("/instance/create", {
       method: "POST",
@@ -279,6 +280,118 @@ export const evolution = {
       {
         method: "POST",
         body: JSON.stringify(body),
+      }
+    );
+  },
+
+  /**
+   * Envia uma midia (imagem, video ou documento) via Evolution v2 endpoint:
+   * `POST /message/sendMedia/{instance}`. Aceita `media` como base64 puro
+   * (sem prefixo `data:`) ou URL publica.
+   *
+   * `mediatype` controla como o WhatsApp do destinatario apresenta a midia:
+   *   - `image` -> renderiza inline com preview
+   *   - `video` -> renderiza com player
+   *   - `document` -> mostra como anexo (PDF/etc)
+   *
+   * Para audio use o endpoint dedicado `sendWhatsAppAudio` (nao implementado
+   * nesta leva — audio fora do escopo).
+   *
+   * `quoted` opcional segue o mesmo formato Baileys usado em `sendText`.
+   *
+   * Risco de ban: mesmo perfil de `sendText` (toca servidor Meta). Para
+   * rajadas, aplicar mesmo jitter usado no front-end de envio de texto.
+   */
+  async sendMedia(
+    instanceName: string,
+    jid: string,
+    params: {
+      mediatype: "image" | "video" | "document";
+      mimetype: string;
+      media: string;
+      fileName: string;
+      caption?: string;
+      linkPreview?: boolean;
+      quoted?: {
+        evolutionMessageId: string;
+        fromMe: boolean;
+        remoteJid: string;
+        body: string | null;
+      };
+    }
+  ): Promise<SendMessageResponse> {
+    const body: Record<string, unknown> = {
+      number: jid,
+      mediatype: params.mediatype,
+      mimetype: params.mimetype,
+      media: params.media,
+      fileName: params.fileName,
+    };
+    if (params.caption) body.caption = params.caption;
+    if (params.linkPreview) body.linkPreview = true;
+    if (params.quoted) {
+      const q = params.quoted;
+      body.quoted = {
+        key: {
+          id: q.evolutionMessageId,
+          fromMe: q.fromMe,
+          remoteJid: q.remoteJid,
+        },
+        message: { conversation: q.body ?? "" },
+      };
+    }
+    return request<SendMessageResponse>(
+      `/message/sendMedia/${encodeURIComponent(instanceName)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      }
+    );
+  },
+
+  /**
+   * Edita o texto de uma mensagem que o operador enviou. Evolution v2
+   * endpoint: `POST /chat/updateMessage/{instance}` com
+   * `{ number, text, key: { id, remoteJid, fromMe } }`.
+   *
+   * Restricoes do WhatsApp (validadas a montante na rota; a Evolution
+   * tambem rejeita do lado dela):
+   *   - Apenas mensagens proprias (`fromMe === true`) podem ser editadas.
+   *   - Janela de 15 minutos a partir do envio original.
+   *   - Apenas conteudo de texto (mensagens com midia tem caption editavel
+   *     em alguns clientes, mas a Evolution 2.3.x trata isso de forma
+   *     instavel — por isso o front so habilita edicao em texto puro).
+   *
+   * Sucesso devolve a mesma estrutura de uma `SendMessageResponse`
+   * (a Evolution gera uma "nova" mensagem do tipo `protocolMessage` no
+   * historico do Baileys que substitui o conteudo da original). O ID
+   * original NAO muda — quem precisa atualizar a linha local usa o
+   * `key.id` da mensagem original que ja conhecia.
+   *
+   * Risco de ban: edicao toca os servidores Meta. Mesmo perfil de risco
+   * de `sendText`. Em rajada, aplicar jitter (mesma fila usada no envio).
+   */
+  async editMessage(
+    instanceName: string,
+    params: {
+      number: string;
+      text: string;
+      key: { id: string; remoteJid: string; fromMe: boolean };
+    }
+  ): Promise<SendMessageResponse> {
+    return request<SendMessageResponse>(
+      `/chat/updateMessage/${encodeURIComponent(instanceName)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          number: params.number,
+          text: params.text,
+          key: {
+            id: params.key.id,
+            remoteJid: params.key.remoteJid,
+            fromMe: params.key.fromMe,
+          },
+        }),
       }
     );
   },
@@ -467,6 +580,7 @@ export const evolution = {
               events: [
                 "MESSAGES_UPSERT",
                 "MESSAGES_UPDATE",
+                "MESSAGES_EDITED",
                 "CONNECTION_UPDATE",
                 "CHATS_UPSERT",
                 "CHATS_UPDATE",

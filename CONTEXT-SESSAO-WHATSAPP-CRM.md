@@ -2,7 +2,15 @@
 
 **Útil como memória quando este chat não estiver disponível.**
 
-**Última atualização:** 12 de maio de 2026 — lista lateral **sem filtro de 30 dias** (paginação “bloco de 30 + Carregar mais”), **reações em mensagens** (`reactions` jsonb, picker de 6 emojis, badges, webhook + load-history + post-login-sync + rota `POST /api/whatsapp/messages/[messageId]/react`), filtragem de bolhas `[unknown]` (reações eram recebidas como mensagens), correção do hydration warning (`suppressHydrationWarning` no `<body>`) e fix do painel de conversa deslocando para a direita (`min-w-0` + `[overflow-wrap:anywhere]`). *(Histórico anterior: paginação de mensagens, mídia, `@lid`, replies, sync incremental, fallback `load-history`.)*
+**Última atualização:** 15 de maio de 2026 — consolidação pós-Leva 3.5:
+
+- **Webhook de edição resiliente (Evolution 2.3.7):** caminho rápido **antes** do bloco que exige `data?.key` — edições chegam como `messages.update` **sem** `key` no nível externo (só `data.message.editedMessage`) e como `messages.edited` **sem** `data.message`. Funções **`extractEditFromData`** + **`extractEditedMessageBody`** cobrem formato **D** (`message.editedMessage.{ key, message }`), `protocolMessage`, e campos top-level (`data.text`, `data.editedMessage`). Log dev `[webhook] edit-payload-dump` quando o formato foge do esperado. Após aplicar edição na linha, se for a **última mensagem do chat**, atualiza **`whatsapp_chats.last_message_preview`** (prévia da lista lateral não fica “presa” no texto antigo).
+- **Checks estilo WhatsApp:** migration **`whatsapp_chats_add_last_message_meta`** — colunas **`last_message_from_me`** e **`last_message_status`**; webhook `messages.upsert` / rotas `send` e `send-media` / `load-history` populam; **`messages.update`** de status propaga para `last_message_status` quando o `evolution_message_id` é o da última mensagem. UI: componente **`MessageStatusChecks`** (1 ✓ enviado, 2 ✓✓ entregue cinza, 2 ✓✓ lidas azuis, relógio pending, erro falhou) substitui palavras “enviada/entregue/lida” nas bolhas e mostra checks **só na prévia lateral** quando a última mensagem foi **minha** (recebida = só texto, como no app oficial).
+- **Painel lateral “Dados do contato”:** edição inline do **`whatsapp_chats.name`** (lápis ao lado do nome); **`renameChat`** no pai com UPDATE otimista + rollback; botão **“Usar nome do lead”** quando há lead vinculado (preenche o draft; Salvar persiste).
+
+Detalhes nas secções **Edição de mensagem**, **Prévia do chat + indicadores de status**, **Painel do contato — nome editável** e tabela **Arquivos-chave**.
+
+*(Leva 3 — 15/mai/2026: edição de mensagem WhatsApp. Leva 1 — 13/mai/2026: hub semântico + heartbeat de webhook. Histórico anterior: lista lateral sem filtro 30d, reações, filtragem `[unknown]`, hydration warning, painel deslocando à direita, paginação, mídia recebida, `@lid`, replies, sync incremental, fallback `load-history`.)*
 
 ---
 
@@ -133,7 +141,7 @@ Após configurar só as variáveis da Evolution, ainda assim dava erro genérico
 **Correção no `load-history`:**
 
 - Preencher **`created_at`** com o **timestamp da mensagem** (mesmo de `sent_at` / `received_at`).
-- Após bulk insert bem-sucedido, se houver mensagem mais recente que `whatsapp_chats.last_message_at`, **atualizar** `last_message_at` + `last_message_preview`.
+- Após bulk insert bem-sucedido, se houver mensagem mais recente que `whatsapp_chats.last_message_at`, **atualizar** `last_message_at` + `last_message_preview` (+ desde maio/2026: **`last_message_from_me`** e **`last_message_status`** quando a msg mais recente do batch for própria).
 
 ---
 
@@ -149,23 +157,28 @@ Linhas antigas podem ficar com `created_at` “errados” até alguém apagar me
 |------|---------|
 | Constantes WhatsApp (janela 30d — só sync incremental) | `src/lib/whatsapp/constants.ts` (`CHAT_VISIBILITY_DAYS`, `chatVisibilityCutoffIso`) |
 | **Reações — emojis + `mergeReactions` + `normalizeReactions`** | `src/lib/whatsapp/reactions.ts` |
+| **Hub semântico de eventos WhatsApp** (`new-message-whatsapp` etc.) | `src/lib/whatsapp/use-whatsapp-events.ts` |
+| **Saúde do realtime + heartbeat do webhook** | `src/lib/whatsapp/use-whatsapp-health.ts` |
 | Helpers JID / telefone (`canonicalRemoteJid`, `@lid`) | `src/lib/evolution/phone.ts` |
-| Cliente Evolution (incl. `sendReaction`, `getBase64FromMediaMessage`) | `src/lib/evolution/client.ts` |
+| Cliente Evolution (incl. `sendReaction`, `getBase64FromMediaMessage`, **`editMessage`**) | `src/lib/evolution/client.ts` |
 | Conectar WhatsApp | `src/app/api/whatsapp/instance/connect/route.ts` |
 | Status instância (incl. `last_manual_sync_at`) | `src/app/api/whatsapp/instance/status/route.ts` |
 | Sync chats (lista, pesado com whatsappNumbers) | `src/app/api/whatsapp/instance/sync/route.ts` |
 | Sync pós-login (background, sem whatsappNumbers) | `src/app/api/whatsapp/post-login-sync/route.ts` |
-| Webhook mensagens (incl. `reactionMessage`) | `src/app/api/whatsapp/webhook/[instance]/route.ts` |
-| Histórico (incl. acumulação de reações em batch) | `src/app/api/whatsapp/messages/load-history/route.ts` |
+| Webhook mensagens (incl. `reactionMessage`, heartbeat, **edição via `protocolMessage` em `messages.update`/`messages.edited`**) | `src/app/api/whatsapp/webhook/[instance]/route.ts` |
+| Histórico (incl. acumulação de reações em batch, **`last_message_from_me` / `last_message_status` no refresh do chat**) | `src/app/api/whatsapp/messages/load-history/route.ts` |
 | **Mídia decodificada (qualquer tipo com `evolution_message_id`)** | `src/app/api/whatsapp/messages/[messageId]/media/route.ts` |
 | **Aplicar/remover reação (UI → Evolution)** | `src/app/api/whatsapp/messages/[messageId]/react/route.ts` |
-| Enviar mensagem | `src/app/api/whatsapp/messages/send/route.ts` |
+| **Editar mensagem própria (UI → Evolution, 15 min)** | `src/app/api/whatsapp/messages/[messageId]/edit/route.ts` |
+| Enviar mensagem (texto) | `src/app/api/whatsapp/messages/send/route.ts` |
+| **Enviar mídia (imagem/video/documento)** | `src/app/api/whatsapp/messages/send-media/route.ts` |
 | Root layout (`suppressHydrationWarning`) | `src/app/layout.tsx` |
 | Layout tenant — disparo sync background | `src/app/[domain]/layout.tsx` + `src/components/layout/whatsapp-post-login-sync.tsx` |
 | Página Conversas (carga server-side, paginação sem 30d) | `src/app/[domain]/conversas/page.tsx` |
-| UI Conversas (paginação, mídia, replies, **reações**) | `src/app/[domain]/conversas/conversas-content.tsx` |
+| UI Conversas (paginação, mídia in/out, replies, reações, envio de mídia, links clicáveis, edição própria, **checks de status**, **prévia lateral**, **painel contato + rename**) | `src/app/[domain]/conversas/conversas-content.tsx` |
 | UI WhatsApp Settings | `src/components/settings/whatsapp-instance-manager.tsx` |
-| Tipos Supabase / schema TS (incl. `WhatsAppMessageReaction`) | `src/lib/types/database.ts` |
+| Tipos Supabase / schema TS (`WhatsAppMessageReaction`, **`last_message_from_me` / `last_message_status` em `WhatsAppChat`**) | `src/lib/types/database.ts` |
+| Banco — colunas meta da última mensagem no chat | migration **`whatsapp_chats_add_last_message_meta`** (Supabase) |
 | Env exemplo | `.env.example` |
 
 ---
@@ -255,6 +268,16 @@ Mesmo sem webhook, o CRM faz polling na Evolution para o **chat ativo** via
 entre chamadas (`EVOLUTION_POLL_INTERVAL_MS`; antes era 30s). Não é instantâneo
 como o webhook, mas reduz a sensação de atraso quando o tunnel cai.
 
+A partir da **Leva 1 (maio/2026)** este polling virou **adaptativo**: enquanto
+`useWhatsAppHealth` reporta `healthy=false` (webhook sem heartbeat fresco ou
+canal Realtime instável), o `tick` continua a cada **10s** disparando
+`syncActiveChat + syncChatList + pullEvolutionForActive` — exatamente o
+comportamento clássico. Assim que o webhook volta a bater
+`whatsapp_instances.webhook_last_seen_at` e o canal Realtime fica `SUBSCRIBED`
+por > 30s, o tick passa a rodar full sync só a cada **60s** e o pull à
+Evolution é desligado (deixado on-demand pelo abrir-chat / botão refresh).
+Ver secção **Polling adaptativo + hub semântico** abaixo.
+
 ---
 
 ## Lista lateral — badge de não lidas (WhatsApp)
@@ -306,6 +329,133 @@ O **`post-login-sync`** e o **`load-history`/polling** usam `findMessages`/`find
 - **`canonicalRemoteJid(remoteJid, remoteJidAlt)`** em **`src/lib/evolution/phone.ts`** — se `remoteJid` é `@lid` e o alt é número real, usa o alt para **`whatsapp_chats.remote_jid`** e unifica histórico com o chat já existente.
 - **`isIndividualJid`** aceita `@s.whatsapp.net`, `@c.us` e **`@lid`** (grupos `@g.us` continuam ignorados onde aplicável).
 - **`post-login-sync`**: normaliza `remoteJid` via `lastMessage.key.remoteJidAlt` antes de upsert de chats; top-N de mensagens inclui também chats `@lid` puros (`allChatRows` filtra com `isIndividualJid`).
+
+---
+
+## Polling adaptativo + hub semântico de eventos (Leva 1 — maio/2026)
+
+**Problema atacado:** mesmo com Supabase Realtime já entregando `INSERT`
+de `whatsapp_messages` e `whatsapp_chats` em tempo real, o painel
+`/conversas` mantinha três loops simultâneos por aba aberta:
+
+1. `setInterval(tick, 10000)` em `conversas-content.tsx` chamando
+   `syncActiveChat` (SELECT em `whatsapp_messages`) e `syncChatList`
+   (SELECT em `whatsapp_chats`).
+2. Dentro do mesmo tick, `pullEvolutionForActive(false)` → `POST
+   /api/whatsapp/messages/load-history` a cada 15s.
+3. O canal `postgres_changes` do Realtime, que já entregava tudo
+   em 95% dos casos.
+
+Em produção com webhook estável os loops (1) e (2) eram trabalho
+desperdiçado: ruidosos no DevTools e proporcionais ao número de
+abas/operadores conectados.
+
+### Heartbeat do webhook
+
+Migration **`whatsapp_instances_webhook_heartbeat`**:
+
+- Coluna **`whatsapp_instances.webhook_last_seen_at timestamptz NULL`**.
+- Tabela publicada na publicação `supabase_realtime` (idempotente).
+
+**`src/app/api/whatsapp/webhook/[instance]/route.ts`** — após validar
+`apikey`, dispara um UPDATE fire-and-forget:
+
+```ts
+const heartbeatCutoffIso = new Date(Date.now() - 15_000).toISOString();
+void supabaseAdmin
+  .from("whatsapp_instances")
+  .update({ webhook_last_seen_at: new Date().toISOString() })
+  .eq("id", instanceRow.id)
+  .or(`webhook_last_seen_at.is.null,webhook_last_seen_at.lt.${heartbeatCutoffIso}`)
+  .then(() => undefined, (err) => console.warn("[webhook] heartbeat update failed", err));
+```
+
+- Throttle no `WHERE`: só atualiza se NULL ou se o último heartbeat foi há
+  mais de 15s. Em rajada, limita o broadcast Realtime a ~4 vezes/min
+  independente da quantidade de eventos.
+- Falha do heartbeat não bloqueia nem invalida o webhook (cai em
+  `console.warn`); o cliente apenas continua reportando `webhookAlive=false`.
+
+### Hub semântico — `src/lib/whatsapp/use-whatsapp-events.ts`
+
+Hook `useWhatsAppEvents(companyId, handlers)` que expõe eventos nomeados
+sobre o `postgres_changes` existente:
+
+| Evento                       | Handler              | Origem                                      |
+|------------------------------|----------------------|---------------------------------------------|
+| `new-message-whatsapp`       | `onNewMessage`       | `whatsapp_messages` INSERT, `from_me=false` |
+| `new-agent-message-whatsapp` | `onNewAgentMessage`  | `whatsapp_messages` INSERT, `from_me=true`  |
+| `message-update-whatsapp`    | `onMessageUpdate`    | `whatsapp_messages` UPDATE                  |
+| `chat-upsert-whatsapp`       | `onChatUpsert`       | `whatsapp_chats` INSERT ou UPDATE           |
+| `chat-delete-whatsapp`       | `onChatDelete`       | `whatsapp_chats` DELETE                     |
+| (raw)                        | `onChannelStatus`    | status do canal Realtime                    |
+
+- Um único canal Phoenix por aba, multiplexado sobre o mesmo WebSocket
+  do Supabase Realtime (sem transporte novo).
+- Constantes exportadas em `WHATSAPP_EVENT` para logs/diagnóstico.
+- Handlers ficam em `useRef` interna → consumidor pode passar funções
+  inline a cada render sem re-subscrever o canal (não perde eventos).
+- Nome de canal aleatório por mount (`wa-events-${companyId}-${rand}`)
+  para neutralizar StrictMode/HMR em dev.
+
+### Saúde — `src/lib/whatsapp/use-whatsapp-health.ts`
+
+Hook `useWhatsAppHealth(companyId)` devolve:
+
+```ts
+{ webhookAlive: boolean, realtimeAlive: boolean, healthy: boolean,
+  webhookLastSeenAt: string | null,
+  channelStatus: "INIT" | "SUBSCRIBED" | "TIMED_OUT" | "CLOSED" | "CHANNEL_ERROR" }
+```
+
+- `WEBHOOK_FRESH_THRESHOLD_MS = 60_000` — webhook é "vivo" se heartbeat
+  < 60s (margem de ~4 batidas tipicas).
+- `REALTIME_STABLE_THRESHOLD_MS = 30_000` — canal só "estável" após 30s
+  contínuos em `SUBSCRIBED`.
+- Implementação faz select inicial em
+  `whatsapp_instances.webhook_last_seen_at` para partir com valor real;
+  depois assina UPDATE em `whatsapp_instances` num canal próprio
+  (`wa-health-*`), multiplexado no mesmo WS do `wa-events-*`.
+- Usa `nowMs` em state (atualizado a cada 5s pelo `setInterval`) em vez
+  de `Date.now()` no corpo do componente — respeita a regra de pureza do
+  React Compiler.
+
+### Polling adaptativo em `conversas-content.tsx`
+
+`tick` agora lê `healthyRef`:
+
+```ts
+const POLL_GRANULARITY_MS = 10_000;
+const POLL_HEALTHY_INTERVAL_MS = 60_000;
+
+function tick() {
+  if (document.hidden) return;
+  const isHealthy = healthyRef.current;
+  const now = Date.now();
+  if (isHealthy && now - lastFullTickAt < POLL_HEALTHY_INTERVAL_MS) return;
+  lastFullTickAt = now;
+  runFullSync(!isHealthy); // includeEvolutionPull = !isHealthy
+}
+```
+
+- Não saudável (boot + degradação): tick 10s + `pullEvolutionForActive` —
+  comportamento idêntico ao pré-otimização.
+- Saudável: tick 60s, sem pull à Evolution.
+- `visibilitychange` (aba volta ao foco): sync forçado imediato com
+  `forceFresh=true` na Evolution, independente da saúde.
+
+### Garantias de "não quebra nada"
+
+- Migration aditiva (coluna nullable, publicação idempotente).
+- Heartbeat opcional: se a publicação cair ou o RLS bloquear o SELECT,
+  o cliente nunca declara `healthy=true` e roda o polling clássico.
+- Polling não foi removido; só **reduzido** quando saudável. Regressão
+  reativa o comportamento clássico em ≤ 10s.
+
+### Documento de referência
+
+Detalhes (cenários, decisões registradas, próximas levas) em
+**`LEVA1-HUB-EVENTOS-WHATSAPP.md`** na raiz do repo.
 
 ---
 
@@ -393,7 +543,7 @@ Referência para revisões futuras; **sem garantias legais** — só orientaçã
 - `instance/sync`: batches `whatsappNumbers` com delay **500–900ms** entre lotes + cooldown **60s** UI + **60s server** (`last_manual_sync_at`). **Além disso**, só monta **`numbersToCheck`** para contatos onde o lookup agrega valor (novos / sem nome na janela ativa — ver secção **Janela de 30 dias**).
 - `post-login-sync`: sem `whatsappNumbers`; cooldown **60s** server (`last_post_login_sync_at`).
 
-**Melhoria futura opcional:** reduzir `pullEvolutionForActive` quando webhook estiver “vivo” (ex.: métrica `webhook_last_seen_at`) — só reduz carga na Evolution, não muda risco de ban.
+**Implementado (Leva 1 — maio/2026):** `pullEvolutionForActive` no `setInterval` agora é desligado quando `useWhatsAppHealth` reporta `healthy=true` (webhook bateu `webhook_last_seen_at` < 60s **E** canal Realtime `SUBSCRIBED` > 30s). Pull à Evolution continua existindo on-demand (abrir chat, botão refresh). Ver secção **Polling adaptativo + hub semântico**.
 
 ---
 
@@ -433,6 +583,107 @@ Tipos TS em **`WhatsAppMessage`** (`database.ts`).
 - **Quote sem `quoted_evolution_message_id`:** clicável desabilitado (sem scroll).
 - **Mensagens antigas já gravadas** com **`quoted_*` null** por causa do bug do top-level **não são reescritas** automaticamente pelo `load-history` (idempotência por `evolution_message_id`). Novas mensagens e novos imports passam a gravar corretamente. **Melhoria opcional futura:** patch que atualize só `quoted_*` quando existir `stanzaId` e a linha já existir.
 - **Grupos:** webhook ignora **`@g.us`** (não individuais); chats **`@lid`** / **`@s.whatsapp.net`** / **`@c.us`** individuais são tratados após **`canonicalRemoteJid`**.
+
+---
+
+## Envio de mídia + links clicáveis (maio/2026)
+
+**Escopo entregue:** envio de **imagem, vídeo, documento** com caption opcional e suporte a reply; **URLs clicáveis** em todas as bolhas (texto puro e captions). **Áudio fora do escopo** — não há gravação no navegador nem upload de áudio.
+
+**Limite por arquivo:** 4 MB. Validado **client (UX)** e **server (defesa em profundidade)**. Transporte cliente → servidor por `multipart/form-data` (binário 1:1, fica abaixo do limite Vercel de 4.5 MB). Servidor converte para base64 antes de chamar Evolution.
+
+### Evolution client — `src/lib/evolution/client.ts`
+
+**`evolution.sendMedia(instanceName, jid, params)`** chama `POST /message/sendMedia/{instance}`:
+
+- `mediatype: "image" | "video" | "document"` — controla como o WhatsApp do destinatário renderiza.
+- `mimetype`, `media` (base64 puro), `fileName` — obrigatórios.
+- `caption`, `linkPreview`, `quoted` — opcionais. `quoted` segue o mesmo formato Baileys de `sendText`.
+- **Risco de ban:** mesmo perfil de `sendText` (toca servidor Meta). Mantém o jitter 250–800ms da fila de envio quando há rajada.
+
+### Backend — `src/app/api/whatsapp/messages/send-media/route.ts` (nova rota)
+
+- Lê `multipart/form-data`. Campos: `file` (File), `chatId` (string), `caption?`, `replyToMessageId?`.
+- Valida `file.size <= 4 MB` → **413** `code: "TOO_LARGE"` se ultrapassa.
+- Detecta `mediaType` pelo `file.type`: `image/*` → image, `video/*` → video, resto → document.
+- Resolve `quotedSnapshot` igual `[send/route.ts](src/app/api/whatsapp/messages/send/route.ts)` (mesmas validações de empresa/chat).
+- `Buffer.from(arrayBuffer).toString("base64")` → `evolution.sendMedia(...)`.
+- Insere linha em `whatsapp_messages` com `media_type`, `media_mime_type`, `body=caption`, `evolution_message_id`, e atualiza `whatsapp_chats.last_message_preview` (`[imagem]` / `[video]` / `[documento]` ou caption truncado em 120 chars).
+- Idempotência: se o webhook já inseriu (race), apenas atualiza `sender_user_id` + `media_type` + `media_mime_type` + (opcional) `body`/`quoted_*`.
+- Trata 502 (Evolution) e 409 (NOT_CONNECTED) iguais ao `/send`.
+
+### UI — `src/app/[domain]/conversas/conversas-content.tsx`
+
+**A. Botão clipe + input file** no `<form>` do envio:
+
+- Ícone de clipe à esquerda do textarea (estilo WhatsApp Web).
+- `<input type="file" hidden accept="image/*,video/*,application/pdf,application/msword,...">`.
+- `handlePickFile` reseta `input.value=""` antes de abrir (permite reselecionar o mesmo arquivo após cancelar).
+- `handleFileSelected` valida tamanho client-side (mesmo limite 4 MB) e abre o modal de preview.
+
+**B. Componente `MediaPreviewDialog`** (no mesmo arquivo, próximo ao `MediaLightbox`):
+
+- Modal fullscreen escuro (`bg-black/90`).
+- Header: botão **X** à esquerda + nome do arquivo no centro.
+- Preview central:
+  - **Imagem**: `<img>` com `object-contain`.
+  - **Vídeo**: `<video controls>` autoplay desligado para o operador conferir antes de enviar.
+  - **Documento**: card com ícone, nome do arquivo, extensão e tamanho (`formatFileSize`).
+- Footer: `<textarea>` de caption ("Adicionar uma legenda... (opcional)") + botão **Enviar** verde com ícone de avião.
+- `Esc` cancela. `Enter` no caption envia (`Shift+Enter` = nova linha).
+- `URL.createObjectURL(file)` criado dentro do modal (encapsulamento). Revogado no unmount via `useEffect`.
+
+**C. `handleSendMedia(file, caption)`**:
+
+- Cria `tempId` + `objectURL` próprio (independente do modal — cada ciclo de vida isolado).
+- Mensagem otimista com `media_type` correto, `body=caption ?? null`.
+- Adiciona à `tempMediaPreviews` (state `Map<tempId, objectURL>`) e à `tempMediaPreviewsRef` (espelho para cleanup no unmount).
+- Encadeia na **mesma `sendQueueRef`** do envio de texto → 3 imagens + 1 texto em rajada chegam ao destinatário na ordem disparada. Jitter 250–800ms aplicado quando a fila não estava vazia (mesmo critério do texto).
+- `fetch("/api/whatsapp/messages/send-media", { method: "POST", body: FormData })`.
+- Sucesso: troca `tempId → realId` em `setMessages` e em `tempMediaPreviews`; `setTimeout(30s, revokeObjectURL)` libera memória após o Realtime entregar a linha real e a rota `/media` cachear.
+- Erro/falha: bolha marcada `failed`, mensagem em `setSendError`, `URL.revokeObjectURL` imediato.
+
+**D. Thumbnail otimista em `MessageImage` / `MessageVideo`**:
+
+- Ambos ganharam prop `srcOverride?: string | null`.
+- Quando passada, renderizam imediatamente com a URL local em vez de chamar `/media`. Sem placeholder "Reproduzir" para vídeo otimista.
+- `MessageBubble` calcula `canUseOptimisticPreview = isTemp && tempPreviewUrl && (image|video)` e passa `srcOverride` correspondente.
+- **Documento temp-** continua mostrando fallback `[enviando documento...]` (preview de PDF/DOCX no DOM não agrega para um envio que dura poucos segundos).
+
+**E. Links clicáveis — `renderTextWithLinks(text)`**:
+
+- Regex `(https?:\/\/[^\s<>]+|www\.[^\s<>]+)/gi`. Cobre >95% das URLs reais em chats de clínica.
+- Pontuação final (`.,!?)]}>;:`) é **removida do `<a>`** e mantida como texto plano fora — evita o clássico bug "link com . no final que não abre".
+- `www.*` recebe `https://` no `href` automaticamente (texto visível permanece `www.*`).
+- `target="_blank" rel="noopener noreferrer"` + classe `text-blue-600 underline [overflow-wrap:anywhere]`.
+- `onClick={e => e.stopPropagation()}` evita disparar click do quote/bolha por engano.
+- Aplicada nos 3 `<p>` que renderizam `message.body` no `MessageBubble`: caption de imagem, caption de vídeo e texto puro.
+- **Não** aplicada no `quoted_body` da citação (a citação é botão "ir para original" — URL ali atrapalha).
+
+### Cenários cobertos
+
+| # | Cenário | Esperado |
+|---|---|---|
+| 1 | Imagem 200 KB JPEG sem caption | Thumb local imediato; troca para `/media` após resposta; status "entregue" via webhook |
+| 2 | Imagem com caption contendo URL | Caption clicável; sem deslocar painel |
+| 3 | Vídeo MP4 com caption | Player local imediato; troca para fluxo normal após id real |
+| 4 | PDF 500 KB | Card de documento; click abre `DocumentLightbox` |
+| 5 | Mídia como reply | Modal de preview mantém barra de reply; backend resolve `quoted_*` |
+| 6 | Imagem 5 MB | Bloqueada client com `setSendError` |
+| 7 | Envio com instância desconectada | Server 409; bolha `failed` |
+| 8 | URL `https://exemplo.com` | Clicável, abre nova aba |
+| 9 | URL `www.foo.com` | Auto-prepend `https://` no href |
+| 10 | URL no início, meio e fim | Texto ao redor preservado |
+| 11 | Texto sem URL | Sem `<a>`, sem regressão |
+| 12 | Caption + URL longa | `[overflow-wrap:anywhere]` impede deslocamento |
+| 13 | Rajada (3 imagens + 1 texto) | `sendQueueRef` preserva ordem; jitter entre envios |
+
+### Pontos de atenção
+
+- **Limite de tamanho** é decidido pelo Vercel (4.5 MB body default) — não pelo WhatsApp em si (que aceita até 16 MB de imagem/vídeo, 100 MB de documento). Para arquivos maiores, próxima leva: upload via Supabase Storage + URL pública para `evolution.sendMedia({ media: url })`.
+- **Vídeo otimista vira placeholder ao trocar id**: durante a transição `tempId → realId` (segundos), o componente re-renderiza sem `srcOverride` e cai no placeholder "Reproduzir vídeo". É tolerável — operador acabou de ver o preview no modal e na bolha temp-.
+- **Áudio**: caminho intencional bloqueado. UI não tem botão de microfone. O `MessageAudio` continua existindo apenas para mídia **recebida**.
+- **Eventos `MESSAGES_EDITED`**: o envio de mídia pelo CRM não emite edição (WhatsApp só permite editar texto). Mídia editada via app oficial ainda dispara o webhook como mensagem nova, não como edição.
 
 ---
 
@@ -595,13 +846,184 @@ Padrão para evitar regressão futura: qualquer flex item filho de container com
 
 ---
 
+## Edição de mensagem WhatsApp (Leva 3 + 3.5 — maio/2026)
+
+**Suporte:** Evolution API ≥ 2.3.5; instalação atual em 2.3.7.
+
+Cobre **dois fluxos**:
+
+1. **Recebimento** — operador edita pelo celular ou contato edita do lado dele → CRM atualiza a bolha em tempo real e mostra o badge "editada".
+2. **Saída** (Leva 3.5) — operador edita pela bolha do CRM → backend chama Evolution → mensagem é alterada também no celular do destinatário e a bolha local atualiza otimisticamente.
+
+### Banco (Supabase)
+
+Migration **`whatsapp_messages_add_edit_columns`**:
+
+- `edited_at timestamptz NULL` — timestamp da última edição. `NULL` = nunca editada.
+- `original_body text NULL` — snapshot do `body` antes da **primeira** edição. `NULL` se nunca editada ou se o body já era null.
+- `edit_count int NOT NULL DEFAULT 0` — contador de edições incrementado a cada UPDATE.
+
+### Evolution client — `src/lib/evolution/client.ts`
+
+- `MESSAGES_EDITED` adicionado à lista de `events` nos métodos `createInstance` e `setWebhook` (mesmo que a Evolution 2.3.x não emita esse evento de forma consistente — ver "Webhook resiliente" abaixo).
+- **`evolution.editMessage(instanceName, { number, text, key })`** — chama `POST /chat/updateMessage/{instance}`. `key` traz `{ id, remoteJid, fromMe }` da mensagem original. Restrições do WhatsApp validadas antes (15 min, fromMe, texto puro) — Evolution rejeita do lado dela se algo escapar.
+
+### Webhook — `src/app/api/whatsapp/webhook/[instance]/route.ts`
+
+**Caminho rápido (Leva 3.6 — correção real em produção):** o bloco principal de `messages.upsert` / `messages.update` / `messages.edited` exige **`data?.key`** para resolver `remoteJid` → chat. Na prática a Evolution 2.3.7 envia edições assim:
+
+- **`messages.update` com `data.message.editedMessage`** mas **`data.key` ausente** no nível externo (só a key vem *dentro* do envelope `editedMessage`).
+- **`messages.edited` com `data.key` preenchido** mas **`data.message` nulo** — o texto pode vir em `data.editedMessage`, `data.text`, etc.
+
+Por isso existe um **handler antecedente**: para `messages.update` **ou** `messages.edited`, chama-se **`extractEditFromData(data)`** (que por sua vez usa **`extractEditedMessageBody` em `data.message`** e fallbacks top-level). Se `newBody !== null`, aplica o `UPDATE` em `whatsapp_messages` por `evolution_message_id` **sem** depender de `data.key` externo.
+
+**Formatos cobertos (resumo):**
+
+| Formato | Onde | Novo texto / ID original |
+|---------|------|--------------------------|
+| A | `data.message` direto | `conversation` / `extendedTextMessage.text` |
+| B/C | `data.message.protocolMessage` | `editedMessage` + `key.id` |
+| D | **`data.message.editedMessage`** (envelope Baileys) | `editedMessage.message` (texto ou `protocolMessage` interno) + `editedMessage.key` |
+| Top-level | `data` sem `message` útil | `data.text`, `data.body`, `data.editedMessage`, cruzado com `data.key` |
+
+Após o `UPDATE` da mensagem: se o registro editado for a **mensagem mais recente** do `chat_id` (ordenar por `created_at DESC`), também atualiza **`whatsapp_chats.last_message_preview`** com os primeiros 120 caracteres do novo texto — evita prévia lateral desatualizada após edição pelo celular ou pelo outro participante.
+
+Diagnóstico em dev:
+
+- `[webhook] message-event-debug` — chaves do `data`, `key`, `messageKeys`, `hasEditedMessage`, etc.
+- **`[webhook] edit-payload-dump`** — JSON do `data` truncado (~4k) quando o evento parece edição mas o corpo não foi extraído.
+
+Fluxo resumido após extrair `newBody`:
+
+1. `targetEvoId = editExtract.originalEvoId ?? data?.key?.id`
+2. `UPDATE whatsapp_messages` (body, `edited_at`, `original_body`, `edit_count`)
+3. Se última mensagem do chat → `UPDATE whatsapp_chats.last_message_preview`
+4. Realtime → `onMessageUpdate` → UI
+
+**Observação:** `load-history` devolve mensagens já com texto final no cache Baileys; os campos de auditoria (`edited_at`, etc.) consolidam-se principalmente via webhook.
+
+### Backend — `PATCH /api/whatsapp/messages/[messageId]/edit` (Leva 3.5)
+
+Body: `{ "body": "novo texto" }` (trim aplicado; vazio → 400).
+
+Validações (em ordem; primeira que falhar retorna erro claro):
+
+1. Sessão autenticada → 401.
+2. Mensagem existe e pertence à `company_id` do operador → 404.
+3. `from_me === true` → 403 (`So e possivel editar mensagens enviadas por voce.`).
+4. `media_type === "text"` → 422 (mídia não suportada no MVP).
+5. `evolution_message_id` presente → 409 (mensagem otimista ainda em envio).
+6. Texto novo ≠ `body` atual (pós-trim) → 422 (evita gastar request à Meta).
+7. `Date.now() - sent_at < 15 min` → 422 com `code: "EDIT_WINDOW_EXPIRED"`.
+8. Instância `status === "connected"` → 409 com `code: "NOT_CONNECTED"`.
+
+Se passar, chama `evolution.editMessage` **antes** de tocar o banco. Em sucesso, `UPDATE body = newBody, edited_at = now, original_body = original_body ?? body, edit_count++` e devolve a row atualizada. Se a mensagem editada for a **mais recente** do chat, também atualiza **`whatsapp_chats.last_message_preview`** (alinhado ao webhook).
+
+### UI — `conversas-content.tsx`
+
+**Badge "editada" no rodapé da bolha** (Leva 3, recebimento):
+- Ícone de lápis (SVG 9×9) + texto `editada` em itálico, em `text-gray-500`.
+- `title` com data/hora completa (`toLocaleString("pt-BR")`).
+- Posicionado à esquerda da hora.
+
+**Botão "Editar" no menu de ação** (Leva 3.5, saída):
+- SVG lápis 13×13, ao lado de Reply e Reagir, escondido por default e visível em hover (`opacity-0 group-hover/msg:opacity-100`).
+- Aparece apenas quando `canEditMessageNow(message)` é true: `from_me === true` + `media_type === "text"` + `evolution_message_id` presente + `id` real (não temp) + `Date.now() - sent_at < 14:30 min` (folga de 30s do limite de 15 min para evitar race).
+
+**Barra "Editando mensagem" acima do input** (estilo WhatsApp):
+- Cor âmbar (`border-amber-200 bg-amber-50`) para distinguir visualmente do reply (que é cinza/azul/verde).
+- Mostra `Original: <texto>` truncado, ícone lápis, e botão X (cancela; Esc também cancela).
+- Reply e edição são **mutuamente exclusivos** — ativar um cancela o outro.
+
+**Estados e funções (em `conversas-content.tsx`):**
+- `editingMessage: { messageId; originalBody } | null` — snapshot do que está sendo editado.
+- `editing: boolean` — request em voo, desabilita o botão Salvar.
+- `startEdit(message)` — pré-preenche `draft` com `body` original; cancela `replyingTo`.
+- `cancelEdit()` — limpa `editingMessage` e `draft`.
+- `submitEdit()` — valida 15 min de novo (defesa contra mensagem antiga visível na UI), faz UPDATE otimista local, chama `PATCH /edit`, em erro faz rollback completo do snapshot (mensagem **e** `last_message_preview` no array `chats` quando a edição era da última mensagem).
+- `handleSend` — redireciona para `submitEdit` quando `editingMessage !== null`.
+- `handleKey` — Esc cancela edição (preferência sobre cancelar reply).
+- Cleanup ao trocar de chat: zera `editingMessage` e `draft` (snapshot referencia mensagem do chat anterior).
+
+**Botão Salvar:**
+- Cor âmbar (`bg-amber-600`) em vez de verde para reforçar visualmente o modo "edição".
+- Disabled quando texto está vazio, edição em voo, ou texto idêntico ao original.
+- Texto: `Salvar` / `Salvando...` em modo edição; `Enviar` em modo normal.
+
+**Anexar arquivo (clipe)** fica `disabled` em modo edição — não faz sentido trocar texto por mídia.
+
+### Pontos de atenção (edição)
+
+- **Instâncias existentes (recebimento):** após deploy, clicar em **Sync** nas Settings para que a Evolution registre `MESSAGES_EDITED` no webhook. **Mesmo sem depender só desse evento**, o **caminho rápido** com `extractEditFromData` cobre `messages.update` sem `data.key` e `messages.edited` sem `data.message`.
+- **Janela de 15 minutos:** validada client-side (UI esconde botão) **e** server-side (rota retorna 422 com `code: "EDIT_WINDOW_EXPIRED"`). A folga de 30s no client evita que o botão fique visível mas o servidor rejeite.
+- **Apenas texto:** mídia não pode ser editada nem na entrada nem na saída (WhatsApp não suporta caption-only edit de forma consistente; conservador no MVP).
+- **`original_body` em mensagens antigas:** linhas gravadas antes desta leva têm `edit_count = 0` e `edited_at = null`. Não há backfill automático.
+- **Risco de ban:** edição toca os servidores Meta — mesmo perfil de risco de `sendText`. Sem rate-limit dedicado: o operador edita uma mensagem por vez na UI, em volume baixo.
+
+---
+
+## Prévia do chat + indicadores de status (maio/2026)
+
+**Problema:** a lista lateral mostrava só texto (`last_message_preview`); após edições feitas fora do CRM, a prévia podia ficar com o **texto antigo**. Os rodapés das bolhas usavam palavras “enviada / entregue / lida” em vez do padrão visual do WhatsApp.
+
+**Banco — migration `whatsapp_chats_add_last_message_meta`**
+
+- `last_message_from_me boolean NULL` — `true` se a última mensagem do chat foi **minha** (CRM ou celular da instância), `false` se recebida do contato.
+- `last_message_status text NULL` — `pending` / `sent` / `delivered` / `read` / `failed` quando aplicável; na prática significativo quando `last_message_from_me = true`. **Backfill:** mensagem mais recente por `chat_id` (`created_at DESC`).
+
+**Quem mantém as colunas**
+
+| Origem | O que grava |
+|--------|-------------|
+| Webhook `messages.upsert` | Ao atualizar o chat após insert: `last_message_from_me`, `last_message_status` (`sent` se `from_me`, senão `null`), `last_message_preview`, etc. |
+| Webhook `messages.update` (ACK) | Depois de atualizar `whatsapp_messages.status`, se o `evolution_message_id` é o da **última** mensagem do chat → atualiza `last_message_status` no registro do chat. |
+| Webhook edição / `PATCH .../edit` | Se a mensagem editada é a mais recente → `last_message_preview` com o novo texto (até 120 chars). |
+| `POST .../send` e `send-media` | `last_message_from_me: true`, `last_message_status: 'sent'` + preview. |
+| `load-history` | Quando avança `last_message_at`/preview pelo batch mais recente, também preenche `last_message_from_me` e `last_message_status` (status só para mensagens `from_me`). |
+
+**UI — componente `MessageStatusChecks` (`conversas-content.tsx`)**
+
+- Ícones SVG no estilo WhatsApp: **1 check** (sent), **2 checks** cinza sobrepostos (delivered), **2 checks azuis** `sky-500` (read), **relógio** (pending), **!** vermelho (failed). Para `sent`, o segundo check fica `invisible` para evitar “pulo” de layout ao virar `delivered`.
+- **Bolhas próprias:** substitui texto “enviada/entregue/lida”.
+- **Prévia na lista lateral:** checks só quando **`last_message_from_me === true`** e há **`last_message_status`**; última mensagem do **contato** = só texto (como no app oficial).
+
+---
+
+## Painel do contato — nome editável (maio/2026)
+
+**Onde:** **`ContactPanel`** em `conversas-content.tsx` (overlay lateral “Dados do contato”).
+
+- **Lápis** ao lado do nome (`chat.name` ou fallback do telefone formatado).
+- Modo edição: input (máx. 120), Salvar / Cancelar, **Enter** / **Esc**.
+- Nome vazio salvo → `name = null` no banco → UI usa o telefone como rótulo.
+- Com **lead vinculado:** botão **“Usar nome do lead”** preenche o campo com o nome do lead; confirmação manual com **Salvar**.
+- **`renameChat`** no componente pai: `UPDATE whatsapp_chats` via Supabase client, atualização **otimista** do array `chats`, **rollback** com erro inline no painel.
+- Troca de chat com o painel aberto: reseta modo edição e re-sincroniza o draft (não mistura contatos).
+
+---
+
 ## Próximas melhorias possíveis (não implementadas ou parciais)
 
 - Paginação “carregar mensagens mais antigas” já cobre o banco; **página 2 puramente na Evolution** (`findMessages` com `page` incremental) segue opcional se quiser histórico além do que está no Supabase.
 - Preview de documentos **não-PDF** (DOCX/XLSX) — hoje só download; PDF usa `<iframe>` nativo.
 - **Backfill** de colunas **`quoted_*`** em mensagens já existentes quando o payload Evolution trouxer `contextInfo` mas o insert original ignorou (update condicional por `evolution_message_id`).
-- Reduzir `pullEvolutionForActive` quando o webhook estiver claramente ativo
-  (ver secção **Risco de banimento** — métrica tipo `webhook_last_seen_at`).
+- ~~Reduzir `pullEvolutionForActive` quando o webhook estiver claramente ativo~~
+  **Implementado na Leva 1 (maio/2026)** — ver secção **Polling adaptativo + hub semântico**.
+- ~~Edição de mensagem chegando do WhatsApp para o CRM via evento `MESSAGES_EDITED`~~
+  **Implementado na Leva 3 (maio/2026)** — ver secção **Edição de mensagem**.
+- ~~Edição de mensagem **saindo** do CRM (operador edita a bolha, repercute no WhatsApp do destinatário)~~
+  **Implementado na Leva 3.5 (maio/2026)** — botão lápis no `MessageBubble`, rota `PATCH /api/whatsapp/messages/[id]/edit`, validação de janela de 15 min em ambas as pontas.
+- ~~Recebimento de edições fora do CRM com prévia lateral e bolhas corretas (`extractEditFromData`, `last_message_preview` na última mensagem)~~
+  **Implementado (maio/2026)** — ver secção **Edição de mensagem** (webhook caminho rápido).
+- ~~Checks de status (✓ / ✓✓) na bolha e na prévia lateral; colunas `last_message_from_me` / `last_message_status`~~
+  **Implementado (maio/2026)** — ver secção **Prévia do chat + indicadores de status**.
+- ~~Painel do contato: editar e salvar nome (`whatsapp_chats.name`); atalho nome do lead~~
+  **Implementado (maio/2026)** — ver secção **Painel do contato — nome editável**.
+- ~~Envio de imagem/vídeo/documento pelo CRM com caption e reply~~
+  **Implementado em maio/2026** — ver secção **Envio de mídia + links clicáveis**.
+- **Envio de mídia > 4 MB**: hoje limitado a 4 MB pelo body default da Vercel. Para arquivos maiores, próxima leva pode usar Supabase Storage como intermediário (upload do cliente direto pro bucket; URL pública passada para `evolution.sendMedia({ media: url })`).
+- **Áudio (gravação no navegador estilo PTT)**: intencionalmente fora desta leva. Requer `MediaRecorder` + endpoint `sendWhatsAppAudio` + UI de gravação tipo "press and hold".
+- **Múltiplos arquivos por envio**: hoje 1 arquivo por modal. Igual ao WhatsApp Web original (que também envia 1 por vez), mas pode ser melhorado se houver demanda.
 - **Picker estendido de reações** (botão “+” abrindo um seletor maior além dos 6 fixos). Hoje `QUICK_REACTION_EMOJIS` está congelado por simplicidade e allowlist server-side.
 - **Backfill de reações antigas:** mensagens já gravadas como `[unknown]` antes da migration estão sendo limpas via `DELETE` manual; idealmente um job que detecte `reactionMessage` lookbehind no Evolution e popule `reactions` retroativamente.
 - **Cache do tunnel Cloudflare em dev:** ao recriar o Quick Tunnel a URL muda — fluxo manual de copiar/colar em `.env.local` poderia ser automatizado por um script Node que faz `cloudflared tunnel --url --output json | jq ... > .env.local`.
